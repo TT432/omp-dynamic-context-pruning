@@ -90,6 +90,7 @@ export function createCompressRangeTool(deps: CompressToolDeps): ToolDefinition 
         logger.info("Compressed range", { blockId, topic: args.topic, messages: applied.messageIds.length, anchors: [plan.entry.startAnchor.slice(0, 30), plan.entry.endAnchor.slice(0, 30)] });
       }
 
+      state.dirty = true;
       persist();
       notifyCompression(execCtx, config, args.topic, entries, totalCompressed);
 

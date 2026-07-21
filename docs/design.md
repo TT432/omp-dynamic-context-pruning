@@ -66,8 +66,9 @@ Flow (content anchors — see "Why not tags" below):
 1. Model calls `compress({ content: [{ startAnchor, endAnchor, summary }] })`,
    quoting short verbatim phrases from the first / last message of the range.
 2. Compress tool substring-matches each anchor (whitespace- and
-   case-normalized) to a message, resolves the span, and stores a compression
-   block keyed by the span's message identities + tool ids.
+   case-normalized) to a message — rejecting it as ambiguous if it matches more
+   than one — resolves the span, and stores a compression block keyed by the
+   span's message identities + tool ids.
 3. Future `context` passes recompute identities, elide messages belonging to an
    active compression block, and inject the summary at the earliest effective
    message.
@@ -120,6 +121,43 @@ src/
   hooks.ts               context/system/event/turn handlers
   commands.ts            /dcp, /dcp-compress, /dcp stats, /dcp context
 ```
+
+## Session lifecycle (omp-accurate)
+
+omp's extension events (from `shared-events.d.ts`) drive binding. DCP does **not**
+trust event payloads for session id or model window — those live on `ctx`:
+
+| Need | Source |
+| ---- | ------ |
+| Session id | `ctx.sessionManager.getSessionId()` (fallback: `getSessionFile()`) |
+| Context window | `ctx.model.contextWindow` (fallback: `ctx.getContextUsage()?.limit`) |
+| Durable state | latest `custom` entry with `customType: "dcp-state"` on `getBranch()` |
+
+### Handlers
+
+| Event | Action |
+| ----- | ------ |
+| `session_start` | `bindSession`: reset if id changed → load `dcp-state` → sync model window → one-shot system inject |
+| `session_before_switch` | `flushSessionState` into the **current** session file (still bound) |
+| `session_switch` | `bindSession` for the new session (reason: new/resume/fork/handoff) |
+| `session_compact` | clear compression blocks (identities invalid) + persist cleared state |
+| `session_shutdown` | flush if dirty |
+| `context` | lazy-bind if unbound; sync model; reconcile compaction via branch timestamps; prune pipeline |
+| `turn_end` | sync model window only |
+
+### Dirty / persist
+
+- `state.dirty` marks durable divergence from the last `dcp-state` entry.
+- Set dirty on: successful compress, manual-mode toggle, compaction clear.
+- Flushed on: compress, manual toggle, `session_before_switch`, `session_shutdown`, post-compact.
+- `loadSessionState` never overwrites the live `sessionId` or a already-synced
+  `modelContextLimit` (serialized values are advisory).
+
+### Same-session re-bind
+
+`bindSession` is a no-op when the resolved id equals `state.sessionId`, so a
+redundant `session_start` after an in-flight compress cannot wipe blocks.
+
 
 ## Faithfulness vs. deferral
 

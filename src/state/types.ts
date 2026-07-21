@@ -113,6 +113,12 @@ export interface SessionState {
   lastCompaction: number;
   currentTurn: number;
   modelContextLimit: number | undefined;
+  /**
+   * True when durable maps have diverged from the last `dcp-state` custom
+   * entry. Flushed on compress, manual-mode change, session_before_switch,
+   * session_shutdown, and post-compaction clear.
+   */
+  dirty: boolean;
   /** Transient (never persisted): the ref-tagged messages from the last context pass, for the compress tool to resolve ranges. */
   lastContextMessages: AgentMessage[] | null;
 }

@@ -98,6 +98,8 @@ export type SessionEntry = SessionEntryBase | MessageEntry | CustomEntry | Custo
 export interface SessionManager {
   getBranch(): SessionEntry[];
   getSessionFile(): string | undefined;
+  /** Stable session id (preferred over getSessionFile for binding). */
+  getSessionId?(): string;
 }
 
 // ---------------------------------------------------------------------------
@@ -114,8 +116,10 @@ export interface ExtensionContext {
   hasUI: boolean;
   cwd: string;
   sessionManager: SessionManager;
-  model?: { id?: string; contextWindow?: number };
-  getContextUsage?(): { tokens?: number; limit?: number };
+  /** Live session model; contextWindow is the authoritative window size. */
+  model?: { id?: string; contextWindow?: number; [k: string]: unknown };
+  /** Optional usage snapshot; `limit` is a fallback window when model is unset. */
+  getContextUsage?(): { tokens?: number; limit?: number } | undefined;
   isIdle(): boolean;
 }
 
@@ -157,8 +161,9 @@ export interface ToolResult {
 // ---------------------------------------------------------------------------
 
 export interface ContextEvent {
+  type?: "context";
+  /** Messages about to be sent to the LLM (deep copy, safe to modify). */
   messages: AgentMessage[];
-  model?: { id?: string; contextWindow?: number };
 }
 
 export interface ToolResultEvent {
@@ -170,12 +175,43 @@ export interface ToolResultEvent {
   isError?: boolean;
 }
 
+/** Fired on initial session load. Payload is type-only; bind via ctx.sessionManager. */
 export interface SessionStartEvent {
-  sessionId?: string;
+  type?: "session_start";
 }
 
+/** Fired before switching sessions (still bound to the old session file). */
+export interface SessionBeforeSwitchEvent {
+  type?: "session_before_switch";
+  reason: "new" | "resume" | "fork" | "handoff";
+  targetSessionFile?: string;
+}
+
+/** Fired after switching to another session. */
+export interface SessionSwitchEvent {
+  type?: "session_switch";
+  reason: "new" | "resume" | "fork" | "handoff";
+  previousSessionFile: string | undefined;
+}
+
+/** Fired after context compaction lands a CompactionEntry. */
+export interface SessionCompactEvent {
+  type?: "session_compact";
+  compactionEntry: { timestamp?: string; [k: string]: unknown };
+  fromExtension: boolean;
+}
+
+/** Fired on process exit (SIGINT/SIGTERM). */
+export interface SessionShutdownEvent {
+  type?: "session_shutdown";
+}
+
+/** Fired at the end of each agent turn. */
 export interface TurnEndEvent {
-  model?: { id?: string; contextWindow?: number };
+  type?: "turn_end";
+  turnIndex?: number;
+  message?: AgentMessage;
+  toolResults?: unknown[];
 }
 
 // ---------------------------------------------------------------------------
@@ -209,6 +245,10 @@ export interface ExtensionAPI {
 
   on(event: "context", handler: (event: ContextEvent, ctx: ExtensionContext) => Promise<{ messages?: AgentMessage[] } | void> | { messages?: AgentMessage[] } | void): void;
   on(event: "session_start", handler: (event: SessionStartEvent, ctx: ExtensionContext) => Promise<void> | void): void;
+  on(event: "session_before_switch", handler: (event: SessionBeforeSwitchEvent, ctx: ExtensionContext) => Promise<void> | void): void;
+  on(event: "session_switch", handler: (event: SessionSwitchEvent, ctx: ExtensionContext) => Promise<void> | void): void;
+  on(event: "session_compact", handler: (event: SessionCompactEvent, ctx: ExtensionContext) => Promise<void> | void): void;
+  on(event: "session_shutdown", handler: (event: SessionShutdownEvent, ctx: ExtensionContext) => Promise<void> | void): void;
   on(event: "tool_result", handler: (event: ToolResultEvent, ctx: ExtensionContext) => Promise<Partial<ToolResult> | void> | Partial<ToolResult> | void): void;
   on(event: "turn_end", handler: (event: TurnEndEvent, ctx: ExtensionContext) => Promise<void> | void): void;
   on(event: "message_end", handler: (event: unknown, ctx: ExtensionContext) => Promise<void> | void): void;

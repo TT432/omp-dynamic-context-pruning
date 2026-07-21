@@ -6,10 +6,8 @@
  * load; runtime actions fire later from the registered handlers.
  *
  * The `ExtensionAPI` type is imported from the local `src/omp` contract
- * declaration (a faithful subset of the omp surface, sourced from
- * omp://extensions.md). At runtime omp injects its host-bundled API and types
- * are erased, so this annotates correctly without needing the host package
- * installed locally for type-checking.
+ * declaration (a faithful subset of the omp surface). At runtime omp injects
+ * its host-bundled API and types are erased.
  */
 
 import type { ExtensionAPI } from "./src/omp";
@@ -17,7 +15,15 @@ import { loadConfig } from "./src/config";
 import { Logger } from "./src/logger";
 import { createSessionState } from "./src/state/state";
 import { saveSessionState } from "./src/state/persistence";
-import { createContextMenuHandler, createSessionStartHandler, createTurnEndHandler } from "./src/hooks";
+import {
+  createContextHandler,
+  createSessionStartHandler,
+  createSessionSwitchHandler,
+  createSessionBeforeSwitchHandler,
+  createSessionShutdownHandler,
+  createSessionCompactHandler,
+  createTurnEndHandler,
+} from "./src/hooks";
 import { createCompressRangeTool } from "./src/compress/range";
 import { registerCommands } from "./src/commands";
 
@@ -40,9 +46,16 @@ export default function dcpExtension(pi: ExtensionAPI): void {
     counters: { contextFetch: 0 },
     systemInjectedFor: null as string | null,
   };
-  // Core pipeline + lifecycle
-  pi.on("context", createContextMenuHandler(deps));
+
+  // Core pipeline
+  pi.on("context", createContextHandler(deps));
+
+  // Session lifecycle — bind / flush / compact
   pi.on("session_start", createSessionStartHandler(deps));
+  pi.on("session_before_switch", createSessionBeforeSwitchHandler(deps));
+  pi.on("session_switch", createSessionSwitchHandler(deps));
+  pi.on("session_compact", createSessionCompactHandler(deps));
+  pi.on("session_shutdown", createSessionShutdownHandler(deps));
   pi.on("turn_end", createTurnEndHandler(deps));
 
   // Compress tool (range mode) — model-authored summaries

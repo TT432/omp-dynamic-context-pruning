@@ -12,6 +12,7 @@ import type { PluginConfig } from "./config";
 import type { Logger } from "./logger";
 import type { SessionState } from "./state/types";
 import { estimateMessagesTokens } from "./token-utils";
+import { saveSessionState } from "./state/persistence";
 
 export interface CommandDeps {
   state: SessionState;
@@ -57,9 +58,13 @@ export function registerCommands(deps: CommandDeps): void {
         const arg = (args || "").trim().split(/\s+/)[1]?.toLowerCase();
         if (arg === "on") {
           state.manualMode = "active";
+          state.dirty = true;
+          saveSessionState(pi, state);
           notify(ctx, "DCP manual mode ON — autonomous pruning paused; use /dcp-compress to trigger.");
         } else {
           state.manualMode = false;
+          state.dirty = true;
+          saveSessionState(pi, state);
           notify(ctx, "DCP manual mode OFF — autonomous pruning resumed.");
         }
         return;

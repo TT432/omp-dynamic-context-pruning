@@ -67,13 +67,15 @@ export function saveSessionState(pi: ExtensionAPI, state: SessionState): void {
   try {
     const data = serialize(state);
     const result = pi.appendEntry(PERSIST_TYPE, data);
+    state.dirty = false;
     if (result && typeof (result as Promise<void>).then === "function") {
       (result as Promise<void>).catch(() => {
-        /* persistence must never break the session */
+        /* persistence must never break the session — re-mark dirty so a later flush retries */
+        state.dirty = true;
       });
     }
   } catch {
-    /* ignore */
+    state.dirty = true;
   }
 }
 
@@ -93,12 +95,16 @@ export function loadSessionState(entries: SessionEntry[], state: SessionState): 
   const data = latest.data as SerializedState | undefined;
   if (!data || data.v !== 1) return false;
 
-  state.sessionId = data.sessionId ?? null;
+  // Keep the live session binding from bindSession; stored sessionId is advisory only.
+  // (Serialized id may be a prior path/id shape and must not unbind the current session.)
   state.isSubAgent = data.isSubAgent ?? false;
   state.manualMode = data.manualMode ?? false;
   state.lastCompaction = data.lastCompaction ?? 0;
   state.currentTurn = data.currentTurn ?? 0;
-  state.modelContextLimit = data.modelContextLimit;
+  // Prefer a previously-synced live model window over a stale persisted one.
+  if (state.modelContextLimit === undefined && data.modelContextLimit !== undefined) {
+    state.modelContextLimit = data.modelContextLimit;
+  }
   state.stats = data.stats ?? { pruneTokenCounter: 0, totalPruneTokens: 0 };
 
   const maps = data.maps;
@@ -121,6 +127,8 @@ export function loadSessionState(entries: SessionEntry[], state: SessionState): 
   // ephemeral caches are rebuilt per-session
   state.nudges = { contextLimitAnchors: new Set(), turnNudgeAnchors: new Set(), iterationNudgeAnchors: new Set() };
   state.pendingManualTrigger = null;
+  state.lastContextMessages = null;
+  state.dirty = false;
 
   return true;
 }

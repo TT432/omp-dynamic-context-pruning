@@ -30,13 +30,14 @@ export function createSessionState(): SessionState {
     currentTurn: 0,
     modelContextLimit: undefined,
     lastContextMessages: null,
+    dirty: false,
   };
 }
 
 /**
- * Reset only the per-session mutable caches while preserving durable
- * compression/prune state. Used on session switch so a new session does not
- * inherit the previous session's ephemeral maps.
+ * Full per-session wipe (durable compression blocks included). Callers that
+ * switch sessions MUST `loadSessionState` afterwards to restore any persisted
+ * dcp-state for the new session. Ephemeral caches are always rebuilt.
  */
 export function resetForSession(state: SessionState, sessionId: string): void {
   state.sessionId = sessionId;
@@ -66,4 +67,5 @@ export function resetForSession(state: SessionState, sessionId: string): void {
   state.lastCompaction = 0;
   state.currentTurn = 0;
   state.lastContextMessages = null;
+  state.dirty = false;
 }
