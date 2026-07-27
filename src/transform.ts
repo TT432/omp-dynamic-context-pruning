@@ -24,7 +24,7 @@
 import type { AgentMessage, ContentBlock } from "./omp";
 import type { Logger } from "./logger";
 import type { CompressionBlock, SessionState } from "./state";
-import { findToolCallIndex, firstUserMessageIndex, isToolCallBlock } from "./anchors";
+import { findToolCallIndex, firstUserMessageIndex, isThinkingBlock, isToolCallBlock } from "./anchors";
 import { SESSION_START_MARKER, formatCompressedSummary } from "./prompts";
 
 interface ResolvedBlock {
@@ -92,6 +92,30 @@ export function applyCompressions(state: SessionState, logger: Logger, messages:
     }
   };
 
+  // Orphan guard: a kept toolCall whose toolResult message was elided would
+  // break provider-side call/result pairing (HTTP 400) — strip the call too.
+  // Typical case: the start anchor's message also carried other tool calls
+  // whose results fall inside the elided span.
+  if (elideWhole.size > 0) {
+    const resultIndexById = new Map<string, number>();
+    for (let i = 0; i < messages.length; i++) {
+      const m = messages[i];
+      if (m.role === "toolResult" && typeof m.toolCallId === "string" && !resultIndexById.has(m.toolCallId)) {
+        resultIndexById.set(m.toolCallId, i);
+      }
+    }
+    for (let i = 0; i < messages.length; i++) {
+      if (elideWhole.has(i)) continue;
+      const content = messages[i].content;
+      if (!Array.isArray(content)) continue;
+      for (const block of content) {
+        if (!isToolCallBlock(block)) continue;
+        const rIdx = resultIndexById.get(block.id);
+        if (rIdx !== undefined && elideWhole.has(rIdx)) stripIds.add(block.id);
+      }
+    }
+  }
+
   for (let i = 0; i < messages.length; i++) {
     if (elideWhole.has(i)) continue;
     pushInjections(i); // summaries take the place of the elided span, before the end anchor
@@ -104,7 +128,9 @@ export function applyCompressions(state: SessionState, logger: Logger, messages:
     if (stripIds.size > 0 && Array.isArray(msg.content)) {
       const filtered = msg.content.filter((block: ContentBlock) => !(isToolCallBlock(block) && stripIds.has(block.id)));
       if (filtered.length !== msg.content.length) {
-        if (filtered.length === 0) continue;
+        // Stripping can leave a thinking-only shell; providers reject empty
+        // assistant messages, so drop those outright.
+        if (!filtered.some((block) => !isThinkingBlock(block))) continue;
         kept = { ...msg, content: filtered };
       }
     }

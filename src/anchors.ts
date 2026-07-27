@@ -47,6 +47,12 @@ export function isToolCallBlock(block: ContentBlock): block is ToolCallBlock {
   return true;
 }
 
+/** Thinking blocks carry no standalone content — a message reduced to them is "empty" to providers. */
+export function isThinkingBlock(block: ContentBlock): boolean {
+  if (typeof block !== "object" || block === null || !("type" in block)) return false;
+  return block.type === "thinking" || block.type === "redacted_thinking";
+}
+
 /** Anchor name from a parsed args object: `anchor` key, or a lone string value (models sometimes guess "name"). */
 function readAnchorArg(args: Record<string, unknown>): string | null {
   const direct = args.anchor;

@@ -561,7 +561,42 @@ const compressTool = createCompressTool({
 }
 
 // ---------------------------------------------------------------------------
-// 11. branchMessages extraction
+// 11. provider validity: thinking-only shell drop + orphan toolCall guard
+//     (the live HTTP 400: "assistant must not be empty")
+// ---------------------------------------------------------------------------
+{
+  const s11 = createSessionState();
+  const tool11 = createCompressTool({ state: s11, logger, zod: zodStub, persist: () => {} });
+  const conv: AgentMessage[] = [
+    { role: "user", content: [txt("p")] },
+    // start anchor shares its message with a real bash call
+    { role: "assistant", content: [anchorCall("t_a", "a"), tu("t_b", "bash", { command: "ls" })] },
+    tres("t_a", "add_anchor", "ok"),
+    tres("t_b", "bash", "files"),
+    { role: "assistant", content: [anchorCall("t_c", "c")] },
+    tres("t_c", "add_anchor", "ok"),
+    // compress call accompanies a thinking block — stripping must drop the shell
+    { role: "assistant", content: [{ type: "thinking", thinking: "hmm" }, tu("t_x", "compress", { startAnchor: "a", endAnchor: "c", summary: "S" })] },
+    tres("t_x", "compress", "ok"),
+  ];
+  await tool11.execute("t_x", { startAnchor: "a", endAnchor: "c", summary: "S: done." }, undefined, undefined, makeCtx(conv.slice(0, 6)));
+
+  // out = [prompt, MARKER, SUMMARY, anchor(t_c), tres(t_c)]
+  const out = applyCompressions(s11, logger, clone(conv));
+  const render = JSON.stringify(out);
+  assert(out.length === 5, `shell drop + orphan guard yields prompt+marker+summary+end pair (got ${out.length})`);
+  assert(!render.includes("t_b"), "orphan guard strips the call whose toolResult was elided");
+  assert(!render.includes("t_a"), "start anchor stripped");
+  assert(!render.includes("hmm"), "thinking-only assistant shell dropped after stripping");
+  assert(render.includes("S: done."), "summary injected");
+  assert(render.includes("t_c"), "end anchor call kept");
+  // every surviving toolCall has its toolResult in the output
+  const ids = [...render.matchAll(/"id":"(t_[a-z])"/g)].map((m) => m[1]);
+  assert(ids.every((id) => render.includes(`"toolCallId\":\"${id}\"`) || render.includes(`"toolCallId":"${id}"`)), "no dangling toolCall without a toolResult");
+}
+
+// ---------------------------------------------------------------------------
+// 12. branchMessages extraction
 // ---------------------------------------------------------------------------
 {
   const msgs = convo();

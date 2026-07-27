@@ -75,6 +75,17 @@ The context transform then applies every active block:
   right **before** the end anchor's message — the summary takes the elided
   span's place and the end anchor follows it.
 
+### Provider-validity guards
+
+Two post-strip invariants keep the provider from rejecting the request
+(learned from a live HTTP 400: "assistant must not be empty"):
+
+- **No empty shells** — a message reduced to thinking blocks by stripping is
+  dropped outright; providers reject content-less assistant messages.
+- **No orphan calls** — a kept toolCall whose toolResult message was elided is
+  stripped as well (call/result pairing). Typical case: the start anchor's
+  message also carried other tool calls whose results fall inside the span.
+
 ### Chaining, absorption, and overlap rules
 
 Given an existing block B `(bStartIdx, bEndIdx)` and a new range
