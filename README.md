@@ -14,7 +14,7 @@ savings are real: the context bar drops and omp's auto-compaction is deferred.
 Two tools are exposed to the model:
 
 - **`add_anchor({ anchor })`** — places a named anchor at the call site. The
-  tool call itself is the anchor: its provider-assigned `tool_use` id is a
+  tool call itself is the anchor: its provider-assigned tool-call id is a
   stable, globally unique identity. Names are unique per session;
   `session_start` is reserved.
 - **`compress({ startAnchor, endAnchor, summary })`** — replaces the span

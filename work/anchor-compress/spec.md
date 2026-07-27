@@ -11,7 +11,7 @@
 ### FR-1 add_anchor 工具
 
 - 签名：`add_anchor({ anchor: string })`。
-- 语义：该次工具调用本身成为对话中的具名锚点；身份 = tool_use id（provider 分配、全局唯一、持久化）。
+- 语义：该次工具调用本身成为对话中的具名锚点；身份 = tool-call id（provider 分配、全局唯一、持久化）。
 - 校验（失败抛错，无副作用）：
   - 名字非空、不含空白、长度 ≤ 64；
   - `session_start` 为保留名，禁止占用；
@@ -28,15 +28,15 @@
 ### FR-3 compress 工具
 
 - 签名：`compress({ startAnchor, endAnchor, summary })`。
-- 解析：在持久化 branch 消息上扫描锚点（add_anchor tool_use + session_start 虚拟锚点）。
+- 解析：在持久化 branch 消息上扫描锚点（add_anchor toolCall + session_start 虚拟锚点）。
 - 区间语义（对 LLM 可见上下文而言）：
-  - 起点为真实锚点：剥除起点 add_anchor 的 tool_use 块及其 tool_result 块（同消息其他内容保留，
+  - 起点为真实锚点：剥除起点 add_anchor 的 toolCall 块及其 toolResult 消息（同消息其他内容保留，
     空消息整条删除）——**起点锚点被消耗**；整条删除 (startMsgIdx, endMsgIdx) 开区间内的消息。
   - 起点为 session_start：虚拟标记保留；整条删除 [firstUser+1, endMsgIdx) 内的消息。
   - **终点锚点保留**：endMsgIdx 消息及其 tool_result 不动。
   - 摘要作为合成 user 消息注入在终点锚点消息**之前**（占据被压缩区间的原位置），
     格式 `[Compressed {start} → {end}]\n{summary}`。
-  - 本次 compress 调用本身（tool_use + tool_result，按 toolCallId）从未来上下文中剥除。
+  - 本次 compress 调用本身（toolCall + toolResult，按 toolCallId）从未来上下文中剥除。
 - 校验（失败抛错，状态不变）：
   - startAnchor/endAnchor 未找到 → 报错并列出可用锚点；
   - startAnchor == endAnchor，或起点位置 ≥ 终点位置 → 报错；
@@ -62,13 +62,15 @@
 - session_start / session_switch：绑定（id 变化则重置）+ 从 branch 最新 dcp-state custom entry 加载。
 - session_before_switch / session_shutdown：dirty 时冲刷。
 - session_compact（含 context 中检测到的 omp 压缩）：清空全部压缩块并持久化。
-- 持久化格式 v2：`{ v:2, sessionId, nextBlockId, blocks:[{id,startName,startToolUseId,endName,endToolUseId,summary,compressCallId,createdAt}] }`。
-  v1 条目直接忽略。
+- 持久化格式 v3：`{ v:3, sessionId, nextBlockId, blocks:[{id,startName,startToolCallId,endName,endToolCallId,summary,compressCallId,createdAt}] }`。
+  旧版本条目直接忽略。
 
 ## 非功能需求
 
 - NFR-1 存储不变量：session 历史字节不动，转换只作用于 LLM 请求副本。
-- NFR-2 tool_use/tool_result 成对剥除，不留孤儿块；剥除后空消息整条删除。
+- NFR-2 toolCall/toolResult 成对剥除，不留孤儿；剥除后空消息整条删除。
+- NFR-5 消息形状以 pi-mono 为准（toolCall/toolResult，见 design.md「Message representation」）；
+  锚点识别兼容 xd:// 信封（`write({path:"xd://add_anchor", content})`）。
 - NFR-3 `tsc --noEmit` 通过；`bun smoke-test.ts` 全绿。
 - NFR-4 无配置文件；调试开关只用环境变量 `DCP_DEBUG`。
 

@@ -6,9 +6,9 @@
  * Per block:
  *   - whole messages in (startMsgIdx, endMsgIdx) are elided — for session_start
  *     starts, [firstUser+1, endMsgIdx);
- *   - the start anchor's add_anchor tool_use/tool_result blocks are stripped
- *     (start anchor consumed; session_start is virtual and kept);
- *   - the compress call itself (tool_use + tool_result, by id) is stripped;
+ *   - the start anchor's add_anchor toolCall block and its toolResult message
+ *     are stripped (start anchor consumed; session_start is virtual and kept);
+ *   - the compress call itself (toolCall + toolResult, by id) is stripped;
  *   - the summary is injected right before the end anchor's message — it
  *     takes the place of the elided span, and the end anchor follows it.
  *     Chained blocks (new start = old end) therefore accumulate summaries
@@ -16,12 +16,15 @@
  *
  * Blocks whose anchors no longer resolve (fork/compaction residue) are dropped
  * and the state marked dirty so a later flush persists the cleanup.
+ *
+ * Message shape: pi-mono — assistant messages carry toolCall blocks; tool
+ * results are standalone toolResult messages keyed by toolCallId.
  */
 
 import type { AgentMessage, ContentBlock } from "./omp";
 import type { Logger } from "./logger";
 import type { CompressionBlock, SessionState } from "./state";
-import { findToolUseIndex, firstUserMessageIndex, isToolResultBlock, isToolUseBlock } from "./anchors";
+import { findToolCallIndex, firstUserMessageIndex, isToolCallBlock } from "./anchors";
 import { SESSION_START_MARKER, formatCompressedSummary } from "./prompts";
 
 interface ResolvedBlock {
@@ -39,12 +42,12 @@ function resolveBlocks(state: SessionState, logger: Logger, messages: AgentMessa
   let dropped = false;
 
   for (const block of state.blocks) {
-    const hi = findToolUseIndex(messages, block.endToolUseId);
+    const hi = findToolCallIndex(messages, block.endToolCallId);
     let lo = -1;
-    if (block.startToolUseId === null) {
+    if (block.startToolCallId === null) {
       if (firstUser >= 0) lo = firstUser + 1;
     } else {
-      const startIdx = findToolUseIndex(messages, block.startToolUseId);
+      const startIdx = findToolCallIndex(messages, block.startToolCallId);
       if (startIdx >= 0) lo = startIdx + 1;
     }
     if (hi < 0 || lo < 0 || lo >= hi) {
@@ -72,7 +75,7 @@ export function applyCompressions(state: SessionState, logger: Logger, messages:
   const injectBefore = new Map<number, CompressionBlock[]>();
   for (const r of resolved) {
     for (let i = r.lo; i < r.hi; i++) elideWhole.add(i);
-    if (r.block.startToolUseId !== null) stripIds.add(r.block.startToolUseId);
+    if (r.block.startToolCallId !== null) stripIds.add(r.block.startToolCallId);
     stripIds.add(r.block.compressCallId);
     const list = injectBefore.get(r.hi) ?? [];
     list.push(r.block);
@@ -93,13 +96,13 @@ export function applyCompressions(state: SessionState, logger: Logger, messages:
     if (elideWhole.has(i)) continue;
     pushInjections(i); // summaries take the place of the elided span, before the end anchor
     const msg = messages[i];
+    // toolResult messages of stripped calls (start anchor / compress) go away wholesale
+    if (msg.role === "toolResult" && typeof msg.toolCallId === "string" && stripIds.has(msg.toolCallId)) {
+      continue;
+    }
     let kept = msg;
     if (stripIds.size > 0 && Array.isArray(msg.content)) {
-      const filtered = msg.content.filter((block: ContentBlock) => {
-        if (isToolUseBlock(block) && stripIds.has(block.id)) return false;
-        if (isToolResultBlock(block) && stripIds.has(block.tool_use_id)) return false;
-        return true;
-      });
+      const filtered = msg.content.filter((block: ContentBlock) => !(isToolCallBlock(block) && stripIds.has(block.id)));
       if (filtered.length !== msg.content.length) {
         if (filtered.length === 0) continue;
         kept = { ...msg, content: filtered };

@@ -11,7 +11,11 @@
  */
 
 // ---------------------------------------------------------------------------
-// Messages
+// Messages (pi-mono shape — packages/ai/src/types.ts)
+//
+// The `context` event fires before convertToLlm, so messages use the internal
+// representation: assistant messages carry `toolCall` blocks with `arguments`,
+// and tool results are standalone `toolResult` messages keyed by `toolCallId`.
 // ---------------------------------------------------------------------------
 
 export interface TextBlock {
@@ -19,22 +23,13 @@ export interface TextBlock {
   text: string;
 }
 
-export interface ToolUseBlock {
-  type: "tool_use";
+export interface ToolCallBlock {
+  type: "toolCall";
   /** Provider-assigned, globally unique, persisted tool-call id. */
   id: string;
   name: string;
-  input: unknown;
+  arguments: Record<string, unknown>;
 }
-
-export interface ToolResultBlock {
-  type: "tool_result";
-  tool_use_id: string;
-  content: ToolResultContent | ToolResultContent[];
-  is_error?: boolean;
-}
-
-export type ToolResultContent = TextBlock | { type: "image"; source: unknown } | string;
 
 export interface ThinkingBlock {
   type: "thinking";
@@ -42,7 +37,7 @@ export interface ThinkingBlock {
   text?: string;
 }
 
-export type ContentBlock = TextBlock | ToolUseBlock | ToolResultBlock | ThinkingBlock | Record<string, unknown>;
+export type ContentBlock = TextBlock | ToolCallBlock | ThinkingBlock | Record<string, unknown>;
 
 export interface MessageUsage {
   input?: number;
@@ -52,8 +47,13 @@ export interface MessageUsage {
 }
 
 export interface AgentMessage {
-  role: "system" | "user" | "assistant" | "custom" | string;
-  content: ContentBlock[];
+  role: "system" | "user" | "assistant" | "toolResult" | "custom" | string;
+  content: string | ContentBlock[];
+  /** toolResult messages: id of the originating tool call. */
+  toolCallId?: string;
+  toolName?: string;
+  isError?: boolean;
+  details?: unknown;
   provider?: string;
   model?: string;
   usage?: MessageUsage;

@@ -2,7 +2,7 @@
  * The two DCP tools.
  *
  * add_anchor — places a named anchor at the call site. The call itself is the
- * anchor: its provider-assigned tool_use id is the durable identity. Names are
+ * anchor: its provider-assigned tool-call id is the durable identity. Names are
  * unique per session and "session_start" is reserved.
  *
  * compress — replaces the span between two anchors with the model-authored
@@ -19,7 +19,7 @@ import type { CompressionBlock, SessionState } from "./state";
 import {
   ADD_ANCHOR_TOOL,
   SESSION_START_ANCHOR,
-  findToolUseIndex,
+  findToolCallIndex,
   firstUserMessageIndex,
   scanAnchors,
   type AnchorRef,
@@ -33,8 +33,8 @@ import { ADD_ANCHOR_PROMPT, COMPRESS_PROMPT } from "./prompts";
 function isAgentMessage(value: unknown): value is AgentMessage {
   if (typeof value !== "object" || value === null) return false;
   if (!("role" in value) || typeof value.role !== "string") return false;
-  if (!("content" in value) || !Array.isArray(value.content)) return false;
-  return true;
+  if (!("content" in value)) return false;
+  return typeof value.content === "string" || Array.isArray(value.content);
 }
 
 /** Messages of the persisted branch, in order. */
@@ -96,7 +96,7 @@ export function createAddAnchorTool(deps: AddAnchorToolDeps): ToolDefinition {
       }
 
       const messages = branchMessages(ctx);
-      const duplicate = scanAnchors(messages).find((a) => a.name === name && a.toolUseId !== toolCallId);
+      const duplicate = scanAnchors(messages).find((a) => a.name === name && a.toolCallId !== toolCallId);
       if (duplicate) {
         throw new Error(`anchor "${name}" already exists in this session; anchor names must be unique`);
       }
@@ -168,7 +168,7 @@ export function createCompressTool(deps: CompressToolDeps): ToolDefinition {
         throw new Error(`unknown endAnchor "${endName}". Available anchors: ${anchorList(anchors)}`);
       }
       if (startName === endName) throw new Error("startAnchor and endAnchor must differ");
-      if (end.toolUseId === null) {
+      if (end.toolCallId === null) {
         throw new Error(`"${SESSION_START_ANCHOR}" cannot be endAnchor — nothing precedes it`);
       }
       if (start.msgIndex >= end.msgIndex) {
@@ -178,7 +178,7 @@ export function createCompressTool(deps: CompressToolDeps): ToolDefinition {
       // First whole-elided message index: for a real start the anchor message
       // itself is only stripped of its anchor block, so elision starts after it;
       // for session_start elision starts right after the first user message.
-      const elideFrom = start.toolUseId === null ? start.msgIndex : start.msgIndex + 1;
+      const elideFrom = start.toolCallId === null ? start.msgIndex : start.msgIndex + 1;
       if (elideFrom >= end.msgIndex) {
         throw new Error(`range between "${startName}" and "${endName}" contains no messages to compress`);
       }
@@ -186,7 +186,7 @@ export function createCompressTool(deps: CompressToolDeps): ToolDefinition {
       const firstUser = firstUserMessageIndex(messages);
       const consumed: CompressionBlock[] = [];
       for (const b of state.blocks) {
-        const bEndIdx = findToolUseIndex(messages, b.endToolUseId);
+        const bEndIdx = findToolCallIndex(messages, b.endToolCallId);
         if (bEndIdx < 0) continue; // orphan block — the transform drops it
         if (bEndIdx === end.msgIndex) {
           throw new Error(
@@ -194,11 +194,11 @@ export function createCompressTool(deps: CompressToolDeps): ToolDefinition {
           );
         }
         const bStartIdx =
-          b.startToolUseId === null
+          b.startToolCallId === null
             ? firstUser >= 0
               ? firstUser + 1
               : -1
-            : findToolUseIndex(messages, b.startToolUseId);
+            : findToolCallIndex(messages, b.startToolCallId);
         // The new end anchor must survive — reject when it lies inside an
         // active compression (stripped as its start, or hidden in its span).
         if (bStartIdx >= 0 && end.msgIndex >= bStartIdx && end.msgIndex < bEndIdx) {
@@ -222,9 +222,9 @@ export function createCompressTool(deps: CompressToolDeps): ToolDefinition {
       const block: CompressionBlock = {
         id: state.nextBlockId++,
         startName,
-        startToolUseId: start.toolUseId,
+        startToolCallId: start.toolCallId,
         endName,
-        endToolUseId: end.toolUseId,
+        endToolCallId: end.toolCallId,
         summary,
         compressCallId: toolCallId,
         createdAt: Date.now(),

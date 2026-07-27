@@ -3,23 +3,34 @@
  *
  * An anchor is a named position in the conversation:
  *   - a real anchor is an `add_anchor` tool call; its identity is the
- *     provider-assigned tool_use id (globally unique, persisted, never mutated);
+ *     provider-assigned tool-call id (globally unique, persisted, never mutated);
  *   - `session_start` is a virtual anchor the plugin injects right after the
  *     first user message (the original prompt). It is never consumed.
  *
- * Anchors are resolved by scanning the message array — no content signatures,
- * no ambiguity: names are unique per session (enforced by the add_anchor tool).
+ * Message shape (verified against pi-mono packages/ai/src/types.ts — the
+ * extension `context` event fires before convertToLlm): assistant messages
+ * carry `{type:"toolCall", id, name, arguments}` blocks; tool results are
+ * standalone `{role:"toolResult", toolCallId}` messages.
+ *
+ * In the omp harness, extension tools surface as xd:// devices invoked through
+ * the built-in `write` tool, so an add_anchor call persists as
+ * `write({path:"xd://add_anchor", content:"<json args>"})`. anchorNameOf
+ * recognizes both the direct and the enveloped form.
  */
 
-import type { AgentMessage, ContentBlock, ToolResultBlock, ToolUseBlock } from "./omp";
+import type { AgentMessage, ContentBlock, ToolCallBlock } from "./omp";
 
 export const SESSION_START_ANCHOR = "session_start";
 export const ADD_ANCHOR_TOOL = "add_anchor";
 
+/** xd:// device invocation envelope used by the omp harness. */
+const XD_WRITE_TOOL = "write";
+const XD_ADD_ANCHOR_PATH = "xd://add_anchor";
+
 export interface AnchorRef {
   name: string;
-  /** tool_use id of the add_anchor call; null for the virtual session_start anchor. */
-  toolUseId: string | null;
+  /** tool-call id of the add_anchor call; null for the virtual session_start anchor. */
+  toolCallId: string | null;
   /**
    * Index of the message containing the anchor call. For session_start, the
    * insertion point: firstUserIndex + 1 (no real message lives there).
@@ -27,37 +38,58 @@ export interface AnchorRef {
   msgIndex: number;
 }
 
-export function isToolUseBlock(block: ContentBlock): block is ToolUseBlock {
+export function isToolCallBlock(block: ContentBlock): block is ToolCallBlock {
   if (typeof block !== "object" || block === null) return false;
-  if (!("type" in block) || block.type !== "tool_use") return false;
+  if (!("type" in block) || block.type !== "toolCall") return false;
   if (!("id" in block) || typeof block.id !== "string") return false;
+  if (!("name" in block) || typeof block.name !== "string") return false;
+  if (!("arguments" in block) || typeof block.arguments !== "object" || block.arguments === null) return false;
   return true;
 }
 
-export function isToolResultBlock(block: ContentBlock): block is ToolResultBlock {
-  if (typeof block !== "object" || block === null) return false;
-  if (!("type" in block) || block.type !== "tool_result") return false;
-  if (!("tool_use_id" in block) || typeof block.tool_use_id !== "string") return false;
-  return true;
+/** Anchor name from a parsed args object: `anchor` key, or a lone string value (models sometimes guess "name"). */
+function readAnchorArg(args: Record<string, unknown>): string | null {
+  const direct = args.anchor;
+  if (typeof direct === "string" && direct.trim().length > 0) return direct.trim();
+  const strings = Object.values(args).filter((v): v is string => typeof v === "string" && v.trim().length > 0);
+  return strings.length === 1 ? strings[0].trim() : null;
 }
 
-/** The anchor name carried by an add_anchor tool_use block, or null. */
+/** Parse the xd envelope's `content` payload (a JSON string, or already an object). */
+function parseContentJson(content: unknown): Record<string, unknown> | null {
+  if (typeof content === "object" && content !== null && !Array.isArray(content)) {
+    // Already an object; property reads below are guarded.
+    return content as Record<string, unknown>;
+  }
+  if (typeof content !== "string") return null;
+  try {
+    const parsed: unknown = JSON.parse(content);
+    if (typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)) {
+      return parsed as Record<string, unknown>;
+    }
+  } catch {
+    /* malformed content is not an anchor */
+  }
+  return null;
+}
+
+/** The anchor name carried by an add_anchor toolCall block (direct or xd-enveloped), or null. */
 export function anchorNameOf(block: ContentBlock): string | null {
-  if (!isToolUseBlock(block) || block.name !== ADD_ANCHOR_TOOL) return null;
-  const input: unknown = block.input;
-  if (typeof input !== "object" || input === null) return null;
-  if (!("anchor" in input) || typeof input.anchor !== "string") return null;
-  const name = input.anchor.trim();
-  return name.length > 0 ? name : null;
+  if (!isToolCallBlock(block)) return null;
+  if (block.name === ADD_ANCHOR_TOOL) return readAnchorArg(block.arguments);
+  if (block.name === XD_WRITE_TOOL) {
+    const path = block.arguments.path;
+    if (typeof path !== "string" || path.trim() !== XD_ADD_ANCHOR_PATH) return null;
+    const payload = parseContentJson(block.arguments.content);
+    return payload === null ? null : readAnchorArg(payload);
+  }
+  return null;
 }
 
-/** Index of the original user prompt: first user message that is not tool results. */
+/** Index of the original user prompt. toolResult is its own role, so role suffices. */
 export function firstUserMessageIndex(messages: AgentMessage[]): number {
   for (let i = 0; i < messages.length; i++) {
-    const m = messages[i];
-    if (m.role !== "user" || !Array.isArray(m.content)) continue;
-    if (m.content.some(isToolResultBlock)) continue;
-    return i;
+    if (messages[i].role === "user") return i;
   }
   return -1;
 }
@@ -71,7 +103,7 @@ export function scanAnchors(messages: AgentMessage[]): AnchorRef[] {
   const anchors: AnchorRef[] = [];
   const firstUser = firstUserMessageIndex(messages);
   if (firstUser >= 0) {
-    anchors.push({ name: SESSION_START_ANCHOR, toolUseId: null, msgIndex: firstUser + 1 });
+    anchors.push({ name: SESSION_START_ANCHOR, toolCallId: null, msgIndex: firstUser + 1 });
   }
   const seen = new Set<string>([SESSION_START_ANCHOR]);
   for (let i = 0; i < messages.length; i++) {
@@ -81,21 +113,20 @@ export function scanAnchors(messages: AgentMessage[]): AnchorRef[] {
       const name = anchorNameOf(block);
       if (name === null || seen.has(name)) continue;
       seen.add(name);
-      anchors.push({ name, toolUseId: (block as ToolUseBlock).id, msgIndex: i });
+      anchors.push({ name, toolCallId: (block as ToolCallBlock).id, msgIndex: i });
     }
   }
   return anchors;
 }
 
-/** Locate the message index containing a tool_use with the given id, or -1. */
-export function findToolUseIndex(messages: AgentMessage[], toolUseId: string): number {
+/** Locate the message index containing a toolCall with the given id, or -1. */
+export function findToolCallIndex(messages: AgentMessage[], toolCallId: string): number {
   for (let i = 0; i < messages.length; i++) {
     const content = messages[i].content;
     if (!Array.isArray(content)) continue;
     for (const block of content) {
-      if (isToolUseBlock(block) && block.id === toolUseId) return i;
+      if (isToolCallBlock(block) && block.id === toolCallId) return i;
     }
   }
   return -1;
 }
-

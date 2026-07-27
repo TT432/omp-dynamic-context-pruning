@@ -1,6 +1,12 @@
 /**
  * Smoke test — exercises the anchor-based compression pipeline against
- * synthetic omp messages. Run: bun smoke-test.ts
+ * synthetic omp messages in the real pi-mono shape (verified against live
+ * session transcripts): assistant messages carry `{type:"toolCall", id, name,
+ * arguments}` blocks; tool results are standalone `{role:"toolResult",
+ * toolCallId}` messages. Extension tools invoked via the xd:// envelope
+ * (`write({path:"xd://add_anchor", content:"<json>"})`) are covered too.
+ *
+ * Run: bun smoke-test.ts
  */
 import { scanAnchors, firstUserMessageIndex } from "./src/anchors";
 import { applyCompressions } from "./src/transform";
@@ -42,19 +48,24 @@ async function assertThrows(fn: () => Promise<unknown>, pattern: RegExp, msg: st
 }
 
 // ---------------------------------------------------------------------------
-// synthetic conversation helpers
+// synthetic conversation helpers (pi-mono shape)
 // ---------------------------------------------------------------------------
 function txt(t: string) {
   return { type: "text", text: t };
 }
-function tu(id: string, name: string, input: unknown) {
-  return { type: "tool_use", id, name, input };
+function tu(id: string, name: string, args: Record<string, unknown>) {
+  return { type: "toolCall", id, name, arguments: args };
 }
-function tr(id: string, text: string) {
-  return { type: "tool_result", tool_use_id: id, content: [txt(text)] };
+/** Tool result: a standalone message in pi-mono shape. */
+function tres(id: string, name: string, text: string): AgentMessage {
+  return { role: "toolResult", toolCallId: id, toolName: name, content: [txt(text)], isError: false };
 }
 function anchorCall(id: string, name: string) {
   return tu(id, "add_anchor", { anchor: name });
+}
+/** xd:// envelope as produced by the omp harness for extension tools. */
+function xdAnchorCall(id: string, jsonArgs: string) {
+  return tu(id, "write", { path: "xd://add_anchor", content: jsonArgs, i: "添加压缩锚点" });
 }
 
 /** Text of the first content block of a tool result, or "". */
@@ -116,36 +127,36 @@ function compressOn(tool: ToolDefinition, params: { startAnchor: string; endAnch
 
 /**
  * Base conversation (indices matter — assertions reference them):
- *  0 user      "Build a demo app."                     ← original prompt
- *  1 assistant text + bash tu_w1
- *  2 user      tr_w1
- *  3 assistant "Marking a1." + add_anchor(a1) tu_a1    ← start anchor (with text)
- *  4 user      tr_a1
- *  5 assistant "Working on feature X." + write tu_w2
- *  6 user      tr_w2
- *  7 assistant "Feature X done." + add_anchor(a2) tu_a2 ← end anchor (with text)
- *  8 user      tr_a2
- *  9 assistant compress tu_c1
- * 10 user      tr_c1
+ *  0 user       "Build a demo app."                     ← original prompt
+ *  1 assistant  text + bash tu_w1
+ *  2 toolResult tu_w1
+ *  3 assistant  "Marking a1." + add_anchor(a1) tu_a1    ← start anchor (with text)
+ *  4 toolResult tu_a1
+ *  5 assistant  "Working on feature X." + write tu_w2
+ *  6 toolResult tu_w2
+ *  7 assistant  "Feature X done." + add_anchor(a2) tu_a2 ← end anchor (with text)
+ *  8 toolResult tu_a2
+ *  9 assistant  compress tu_c1
+ * 10 toolResult tu_c1
  */
 function convo(): AgentMessage[] {
   return [
     { role: "user", content: [txt("Build a demo app.")] },
     { role: "assistant", content: [txt("I'll start."), tu("tu_w1", "bash", { command: "ls" })] },
-    { role: "user", content: [tr("tu_w1", "file1 file2")] },
+    tres("tu_w1", "bash", "file1 file2"),
     { role: "assistant", content: [txt("Marking a1."), anchorCall("tu_a1", "a1")] },
-    { role: "user", content: [tr("tu_a1", 'Anchor "a1" recorded.')] },
+    tres("tu_a1", "add_anchor", 'Anchor "a1" recorded.'),
     { role: "assistant", content: [txt("Working on feature X."), tu("tu_w2", "write", { path: "x.ts" })] },
-    { role: "user", content: [tr("tu_w2", "ok")] },
+    tres("tu_w2", "write", "ok"),
     { role: "assistant", content: [txt("Feature X done."), anchorCall("tu_a2", "a2")] },
-    { role: "user", content: [tr("tu_a2", 'Anchor "a2" recorded.')] },
+    tres("tu_a2", "add_anchor", 'Anchor "a2" recorded.'),
     { role: "assistant", content: [tu("tu_c1", "compress", { startAnchor: "a1", endAnchor: "a2", summary: "D1" })] },
-    { role: "user", content: [tr("tu_c1", "Compressed a1 → a2")] },
+    tres("tu_c1", "compress", "Compressed a1 → a2"),
   ];
 }
 
 function clone(messages: AgentMessage[]): AgentMessage[] {
-  return messages.map((m) => ({ ...m, content: m.content.map((b) => structuredClone(b)) }));
+  return messages.map((m) => ({ ...m, content: Array.isArray(m.content) ? m.content.map((b) => structuredClone(b)) : m.content }));
 }
 
 const state = createSessionState();
@@ -160,19 +171,33 @@ const compressTool = createCompressTool({
 });
 
 // ---------------------------------------------------------------------------
-// 1. anchor scanning
+// 1. anchor scanning (direct form + xd:// envelope)
 // ---------------------------------------------------------------------------
 {
   const anchors = scanAnchors(convo());
   assert(anchors.map((a) => a.name).join(",") === "session_start,a1,a2", "scanAnchors finds session_start + named anchors in order");
-  assert(anchors[0].toolUseId === null && anchors[0].msgIndex === 1, "session_start is virtual, inserted after the prompt");
-  assert(anchors[1].toolUseId === "tu_a1" && anchors[1].msgIndex === 3, "a1 resolves to its tool_use id and message index");
+  assert(anchors[0].toolCallId === null && anchors[0].msgIndex === 1, "session_start is virtual, inserted after the prompt");
+  assert(anchors[1].toolCallId === "tu_a1" && anchors[1].msgIndex === 3, "a1 resolves to its tool-call id and message index");
   assert(firstUserMessageIndex(convo()) === 0, "first user message is the prompt");
-  const weird: AgentMessage[] = [
-    { role: "user", content: [tr("tu_z", "x")] },
-    { role: "user", content: [txt("real prompt")] },
+  const weird: AgentMessage[] = [tres("tu_z", "bash", "x"), { role: "user", content: [txt("real prompt")] }];
+  assert(firstUserMessageIndex(weird) === 1, "toolResult message is not the original prompt");
+
+  // xd:// envelope: anchor name inside the content JSON ("anchor" key and the
+  // single-string fallback for models guessing "name")
+  const env: AgentMessage[] = [
+    { role: "user", content: [txt("p")] },
+    { role: "assistant", content: [xdAnchorCall("w1", '{"anchor":"x1"}')] },
+    tres("w1", "write", "Anchor recorded"),
+    { role: "assistant", content: [xdAnchorCall("w2", '{"name":"x2"}')] },
+    tres("w2", "write", "Anchor recorded"),
+    { role: "assistant", content: [tu("w3", "write", { path: "xd://compress", content: '{"startAnchor":"x1","endAnchor":"x2","summary":"s"}' })] },
+    { role: "assistant", content: [tu("w4", "write", { path: "src/foo.ts", content: "code" })] },
   ];
-  assert(firstUserMessageIndex(weird) === 1, "tool_result-only user message is not the original prompt");
+  const envAnchors = scanAnchors(env);
+  assert(
+    envAnchors.map((a) => `${a.name}@${a.toolCallId}`).join(",") === "session_start@null,x1@w1,x2@w2",
+    "xd:// envelope anchors resolve (anchor key + single-string fallback); compress envelope and plain writes ignored",
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -225,8 +250,8 @@ const compressTool = createCompressTool({
   assert(state.blocks.length === 1, "compress records one block");
   const b = state.blocks[0];
   assert(
-    b.startName === "a1" && b.startToolUseId === "tu_a1" && b.endName === "a2" && b.endToolUseId === "tu_a2" && b.compressCallId === "tu_c1",
-    "block stores anchor names, tool_use ids, and the compress call id",
+    b.startName === "a1" && b.startToolCallId === "tu_a1" && b.endName === "a2" && b.endToolCallId === "tu_a2" && b.compressCallId === "tu_c1",
+    "block stores anchor names, tool-call ids, and the compress call id",
   );
   assert(state.dirty === false, "compress persists immediately (dirty cleared)");
   assert(appended.length === before + 1 && appended[before].customType === PERSIST_TYPE, "compress appended a dcp-state entry");
@@ -238,11 +263,11 @@ const compressTool = createCompressTool({
   assert(out.length === 8, `transform elides 3 + drops 2 stripped messages, injects marker + summary (got ${out.length})`);
   assert(JSON.stringify(out[1]).includes("session_start"), "session_start marker sits right after the prompt");
   assert(render.includes("Marking a1."), "start anchor message keeps its non-anchor text");
-  assert(!render.includes("tu_a1"), "start anchor tool_use stripped (anchor consumed)");
+  assert(!render.includes("tu_a1"), "start anchor toolCall stripped (anchor consumed)");
   assert(!render.includes("Working on feature X."), "span content elided");
-  assert(!render.includes('Anchor \\"a1\\" recorded'), "start anchor tool_result elided");
+  assert(!render.includes('Anchor \\"a1\\" recorded'), "start anchor toolResult elided");
   assert(render.includes("Feature X done."), "end anchor message survives with its text");
-  assert(render.includes("tu_a2"), "end anchor tool_use survives (kept for chaining)");
+  assert(render.includes("tu_a2"), "end anchor toolCall survives (kept for chaining)");
   assert(render.includes("[Compressed: a1 → a2]") && render.includes("D1: built feature X"), "summary injected with header");
   assert(!render.includes("tu_c1"), "compress call itself stripped from context");
   assert(JSON.stringify(out[5]).includes("[Compressed: a1 → a2]"), "summary takes the place of the elided span, before the end anchor");
@@ -251,17 +276,17 @@ const compressTool = createCompressTool({
 }
 
 // ---------------------------------------------------------------------------
-// 4. chaining: compress(a2 → a3) consumes the (a1 → a2) block
+// 4. chaining: compress(a2 → a3) keeps both blocks; summaries accumulate
 // ---------------------------------------------------------------------------
 {
   const extended: AgentMessage[] = [
     ...convo(),
     { role: "assistant", content: [txt("Second phase."), tu("tu_w3", "bash", { command: "test" })] },
-    { role: "user", content: [tr("tu_w3", "pass")] },
+    tres("tu_w3", "bash", "pass"),
     { role: "assistant", content: [anchorCall("tu_a3", "a3")] },
-    { role: "user", content: [tr("tu_a3", 'Anchor "a3" recorded.')] },
+    tres("tu_a3", "add_anchor", 'Anchor "a3" recorded.'),
     { role: "assistant", content: [tu("tu_c2", "compress", { startAnchor: "a2", endAnchor: "a3", summary: "D2" })] },
-    { role: "user", content: [tr("tu_c2", "ok")] },
+    tres("tu_c2", "compress", "ok"),
   ];
   const res = await compressTool.execute(
     "tu_c2",
@@ -295,14 +320,14 @@ const compressTool = createCompressTool({
   const mini: AgentMessage[] = [
     { role: "user", content: [txt("Original prompt.")] },
     { role: "assistant", content: [tu("tu_x1", "bash", { command: "ls" })] },
-    { role: "user", content: [tr("tu_x1", "files")] },
+    tres("tu_x1", "bash", "files"),
     { role: "assistant", content: [anchorCall("tu_b1", "b1")] },
-    { role: "user", content: [tr("tu_b1", "ok")] },
+    tres("tu_b1", "add_anchor", "ok"),
     { role: "assistant", content: [tu("tu_c3", "compress", { startAnchor: "session_start", endAnchor: "b1", summary: "DS" })] },
-    { role: "user", content: [tr("tu_c3", "ok")] },
+    tres("tu_c3", "compress", "ok"),
   ];
   await tool2.execute("tu_c3", { startAnchor: "session_start", endAnchor: "b1", summary: "DS: early exploration done." }, undefined, undefined, makeCtx(mini.slice(0, 5)));
-  assert(s2.blocks.length === 1 && s2.blocks[0].startToolUseId === null, "session_start block stores a null startToolUseId");
+  assert(s2.blocks.length === 1 && s2.blocks[0].startToolCallId === null, "session_start block stores a null startToolCallId");
 
   // out = [prompt, MARKER, SUMMARY, anchor(b1), tr_b1]
   const out = applyCompressions(s2, logger, clone(mini));
@@ -344,20 +369,20 @@ const compressTool = createCompressTool({
   );
   assert(s3.blocks.length === 0, "failed compresses record no blocks");
 
-  // same-end rejection + partial-overlap rejection + full subsumption
+  // same-end rejection + end-inside rejection + full subsumption + true partial
   const s4 = createSessionState();
   const pi4 = makePi([]);
   const tool4 = createCompressTool({ state: s4, logger, zod: zodStub, persist: () => saveSessionState(pi4, s4) });
   const wide: AgentMessage[] = [
     { role: "user", content: [txt("p")] },
     { role: "assistant", content: [anchorCall("tu_q1", "q1")] },
-    { role: "user", content: [tr("tu_q1", "1")] },
+    tres("tu_q1", "add_anchor", "1"),
     { role: "assistant", content: [txt("mid1"), anchorCall("tu_q2", "q2")] },
-    { role: "user", content: [tr("tu_q2", "2")] },
+    tres("tu_q2", "add_anchor", "2"),
     { role: "assistant", content: [txt("mid2"), anchorCall("tu_q3", "q3")] },
-    { role: "user", content: [tr("tu_q3", "3")] },
+    tres("tu_q3", "add_anchor", "3"),
     { role: "assistant", content: [anchorCall("tu_q4", "q4")] },
-    { role: "user", content: [tr("tu_q4", "4")] },
+    tres("tu_q4", "add_anchor", "4"),
   ];
   await compressOn(tool4, { startAnchor: "q2", endAnchor: "q3", summary: "middle" }, makeCtx(wide));
   assert(s4.blocks.length === 1, "setup block recorded");
@@ -389,7 +414,7 @@ const compressTool = createCompressTool({
 }
 
 // ---------------------------------------------------------------------------
-// 7. persistence round trip (v2) + v1 ignored
+// 7. persistence round trip (v3) + older versions ignored
 // ---------------------------------------------------------------------------
 {
   const s5 = createSessionState();
@@ -397,9 +422,9 @@ const compressTool = createCompressTool({
   s5.blocks.push({
     id: 7,
     startName: "a1",
-    startToolUseId: "tu_a1",
+    startToolCallId: "tu_a1",
     endName: "a2",
-    endToolUseId: "tu_a2",
+    endToolCallId: "tu_a2",
     summary: "S",
     compressCallId: "tu_c",
     createdAt: 123,
@@ -418,11 +443,13 @@ const compressTool = createCompressTool({
   assert(loaded && s6.blocks.length === 1 && s6.blocks[0].id === 7 && s6.blocks[0].compressCallId === "tu_c", "round trip restores the block");
   assert(s6.nextBlockId === 8, "nextBlockId restored");
 
-  const oldBranch: SessionEntry[] = [
-    { type: "custom", id: "c2", parentId: null, timestamp: new Date().toISOString(), customType: PERSIST_TYPE, data: { v: 1, maps: {} } },
-  ];
-  const s7 = createSessionState();
-  assert(loadSessionState(oldBranch, s7) === false && s7.blocks.length === 0, "v1 entries are ignored");
+  for (const v of [1, 2]) {
+    const oldBranch: SessionEntry[] = [
+      { type: "custom", id: "c2", parentId: null, timestamp: new Date().toISOString(), customType: PERSIST_TYPE, data: { v, maps: {} } },
+    ];
+    const s7 = createSessionState();
+    assert(loadSessionState(oldBranch, s7) === false && s7.blocks.length === 0, `v${v} entries are ignored`);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -437,7 +464,7 @@ const compressTool = createCompressTool({
   const seeded = createSessionState();
   seeded.sessionId = "sess-life";
   seeded.blocks.push({
-    id: 3, startName: "a", startToolUseId: "tu_a", endName: "b", endToolUseId: "tu_b",
+    id: 3, startName: "a", startToolCallId: "tu_a", endName: "b", endToolCallId: "tu_b",
     summary: "seed", compressCallId: "tu_c", createdAt: 1,
   });
   seeded.nextBlockId = 4;
@@ -489,7 +516,7 @@ const compressTool = createCompressTool({
 
   // orphan: block whose end anchor no longer exists gets dropped + dirty
   s9.blocks.push({
-    id: 99, startName: "ghost1", startToolUseId: "tu_g1", endName: "ghost2", endToolUseId: "tu_gone",
+    id: 99, startName: "ghost1", startToolCallId: "tu_g1", endName: "ghost2", endToolCallId: "tu_gone",
     summary: "ghost", compressCallId: "tu_gc", createdAt: 0,
   });
   s9.dirty = false;
@@ -499,7 +526,42 @@ const compressTool = createCompressTool({
 }
 
 // ---------------------------------------------------------------------------
-// 10. branchMessages extraction
+// 10. full pipeline through the xd:// envelope (the live failure mode)
+// ---------------------------------------------------------------------------
+{
+  const s10 = createSessionState();
+  const tool10 = createCompressTool({ state: s10, logger, zod: zodStub, persist: () => {} });
+  // Mirrors the qylEyelib session: anchors added via write({path:"xd://add_anchor"})
+  const live: AgentMessage[] = [
+    { role: "user", content: [txt("整理 JE/BE 测试方法")] },
+    { role: "assistant", content: [txt("先摸底。"), tu("tu_r1", "read", { path: "a.md" })] },
+    tres("tu_r1", "read", "file a"),
+    { role: "assistant", content: [xdAnchorCall("w1", '{"name": "reorg_done"}')] },
+    tres("w1", "write", 'Anchor "reorg_done" recorded.'),
+    { role: "assistant", content: [tu("tu_c9", "write", { path: "xd://compress", content: '{"startAnchor":"session_start","endAnchor":"reorg_done","summary":"S"}' })] },
+    tres("tu_c9", "write", "Compressed"),
+  ];
+  // the exact reported flow: compress right after the anchor was added
+  const res = await tool10.execute(
+    "tu_c9",
+    { startAnchor: "session_start", endAnchor: "reorg_done", summary: "S:摸底完成。" },
+    undefined,
+    undefined,
+    makeCtx(live.slice(0, 5)),
+  );
+  assert(s10.blocks.length === 1 && s10.blocks[0].endToolCallId === "w1", "xd-enveloped end anchor resolves immediately after add_anchor");
+  assert(textOf(res).includes('Compressed "session_start" → "reorg_done"'), "compress confirms the enveloped range");
+
+  const out = applyCompressions(s10, logger, clone(live));
+  const render = JSON.stringify(out);
+  assert(render.includes("S:摸底完成。"), "summary injected for enveloped block");
+  assert(!render.includes("file a"), "span elided through the envelope");
+  assert(render.includes("w1"), "enveloped end anchor survives");
+  assert(!render.includes("tu_c9"), "enveloped compress call stripped");
+}
+
+// ---------------------------------------------------------------------------
+// 11. branchMessages extraction
 // ---------------------------------------------------------------------------
 {
   const msgs = convo();

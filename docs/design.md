@@ -19,13 +19,35 @@ replaced with summaries; the persisted session stays byte-for-byte intact.
 An anchor is a named position in the conversation:
 
 - A **real anchor** is an `add_anchor` tool call. Its identity is the
-  provider-assigned `tool_use.id` — globally unique, persisted, never mutated.
+  provider-assigned `toolCall.id` — globally unique, persisted, never mutated.
   No content signatures, no substring matching: resolution is an exact scan of
   the message array. Names are unique per session (the tool rejects duplicates,
   excluding its own in-flight call) and `session_start` is reserved.
 - **`session_start`** is a virtual anchor the transform injects right after the
   first user message (role `user` without `tool_result` blocks — the original
   prompt). It is never consumed and is always available as a `startAnchor`.
+
+## Message representation (verified against live transcripts)
+
+The `context` event fires before `convertToLlm` (pi-mono `agent-loop.ts`), so
+messages use the internal pi-mono shape, **not** the Anthropic wire shape:
+
+- assistant messages carry `{type:"toolCall", id, name, arguments}` blocks;
+- tool results are standalone `{role:"toolResult", toolCallId, toolName,
+  content, isError}` messages — not `tool_result` blocks inside a user message;
+- user message content may be a plain string.
+
+Extension tools surface in the transcript through the harness's xd:// device
+layer: the model invokes them via the built-in `write` tool, so an anchor call
+persists as `write({path:"xd://add_anchor", content:"<json args>"})` and a
+compress call as `write({path:"xd://compress", ...})`. Anchor scanning
+recognizes both the direct `add_anchor(...)` form and the xd envelope (anchor
+name from the `anchor` arg, falling back to a lone string value — models
+sometimes guess `name`). Stripping is id-based and therefore shape-agnostic.
+
+(The pre-rewrite `omp.d.ts` declared Anthropic-style `tool_use`/`tool_result`
+blocks; that shape never occurs, and code written against it silently no-ops —
+which is exactly how the first anchor-mode build failed in production.)
 
 ## compress semantics
 
@@ -35,8 +57,8 @@ compression block:
 
 ```ts
 {
-  id, startName, startToolUseId /* null = session_start */,
-  endName, endToolUseId, summary, compressCallId, createdAt
+  id, startName, startToolCallId /* null = session_start */,
+  endName, endToolCallId, summary, compressCallId, createdAt
 }
 ```
 
@@ -44,11 +66,11 @@ The context transform then applies every active block:
 
 - whole-elide messages in `(startMsgIdx, endMsgIdx)` — for `session_start`
   starts, `[firstUser+1, endMsgIdx)`;
-- strip the start anchor's `add_anchor` tool_use/tool_result blocks (**start
-  anchor consumed**; non-anchor content of the same message is kept, empty
-  messages are dropped);
+- strip the start anchor's `add_anchor` toolCall block and its toolResult
+  message (**start anchor consumed**; non-anchor content of the same message is
+  kept, empty messages are dropped);
 - keep the end anchor untouched (**end anchor survives** for chaining);
-- strip the compress call itself (tool_use + tool_result, by `compressCallId`);
+- strip the compress call itself (toolCall + toolResult, by `compressCallId`);
 - inject `[Compressed: start → end]\n<summary>` as a synthetic user message
   right **before** the end anchor's message — the summary takes the elided
   span's place and the end anchor follows it.
@@ -83,8 +105,8 @@ messages left empty are dropped.
 index.ts        extension factory: registers context handler, lifecycle, tools
 src/
   omp.d.ts      ambient declarations for the omp API surface used
-  anchors.ts    anchor model: scanAnchors, session_start, tool_use/result lookup
-  state.ts      SessionState, CompressionBlock, dcp-state (v2) persistence
+  anchors.ts    anchor model: scanAnchors, session_start, toolCall/toolResult lookup
+  state.ts      SessionState, CompressionBlock, dcp-state (v3) persistence
   tools.ts      add_anchor + compress tool factories
   transform.ts  the context-transform heart: elide / strip / inject
   hooks.ts      session lifecycle: bind, flush, compact, context handler
