@@ -99,14 +99,3 @@ export function findToolUseIndex(messages: AgentMessage[], toolUseId: string): n
   return -1;
 }
 
-/** Locate the message index containing the tool_result for the given tool_use id, or -1. */
-export function findToolResultIndex(messages: AgentMessage[], toolUseId: string): number {
-  for (let i = 0; i < messages.length; i++) {
-    const content = messages[i].content;
-    if (!Array.isArray(content)) continue;
-    for (const block of content) {
-      if (isToolResultBlock(block) && block.tool_use_id === toolUseId) return i;
-    }
-  }
-  return -1;
-}

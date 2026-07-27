@@ -9,7 +9,10 @@
  *   - the start anchor's add_anchor tool_use/tool_result blocks are stripped
  *     (start anchor consumed; session_start is virtual and kept);
  *   - the compress call itself (tool_use + tool_result, by id) is stripped;
- *   - the summary is injected right after the end anchor's tool_result message.
+ *   - the summary is injected right before the end anchor's message — it
+ *     takes the place of the elided span, and the end anchor follows it.
+ *     Chained blocks (new start = old end) therefore accumulate summaries
+ *     in order instead of absorbing them.
  *
  * Blocks whose anchors no longer resolve (fork/compaction residue) are dropped
  * and the state marked dirty so a later flush persists the cleanup.
@@ -18,17 +21,15 @@
 import type { AgentMessage, ContentBlock } from "./omp";
 import type { Logger } from "./logger";
 import type { CompressionBlock, SessionState } from "./state";
-import { findToolResultIndex, findToolUseIndex, firstUserMessageIndex, isToolResultBlock, isToolUseBlock } from "./anchors";
+import { findToolUseIndex, firstUserMessageIndex, isToolResultBlock, isToolUseBlock } from "./anchors";
 import { SESSION_START_MARKER, formatCompressedSummary } from "./prompts";
 
 interface ResolvedBlock {
   block: CompressionBlock;
   /** First whole-elided message index. */
   lo: number;
-  /** End anchor message index (exclusive elision bound). */
+  /** End anchor message index (exclusive elision bound; summary goes before it). */
   hi: number;
-  /** Original message index after which the summary is injected. */
-  injectAfter: number;
 }
 
 function resolveBlocks(state: SessionState, logger: Logger, messages: AgentMessage[]): ResolvedBlock[] {
@@ -51,8 +52,7 @@ function resolveBlocks(state: SessionState, logger: Logger, messages: AgentMessa
       dropped = true;
       continue;
     }
-    const endResultIdx = findToolResultIndex(messages, block.endToolUseId);
-    resolved.push({ block, lo, hi, injectAfter: Math.max(hi, endResultIdx) });
+    resolved.push({ block, lo, hi });
     survivors.push(block);
   }
 
@@ -69,19 +69,19 @@ export function applyCompressions(state: SessionState, logger: Logger, messages:
 
   const elideWhole = new Set<number>();
   const stripIds = new Set<string>();
-  const injectAt = new Map<number, CompressionBlock[]>();
+  const injectBefore = new Map<number, CompressionBlock[]>();
   for (const r of resolved) {
     for (let i = r.lo; i < r.hi; i++) elideWhole.add(i);
     if (r.block.startToolUseId !== null) stripIds.add(r.block.startToolUseId);
     stripIds.add(r.block.compressCallId);
-    const list = injectAt.get(r.injectAfter) ?? [];
+    const list = injectBefore.get(r.hi) ?? [];
     list.push(r.block);
-    injectAt.set(r.injectAfter, list);
+    injectBefore.set(r.hi, list);
   }
 
   const out: AgentMessage[] = [];
   const pushInjections = (idx: number): void => {
-    const list = injectAt.get(idx);
+    const list = injectBefore.get(idx);
     if (!list) return;
     for (const b of list) {
       logger.debug("Injected compress summary", { blockId: b.id });
@@ -91,6 +91,7 @@ export function applyCompressions(state: SessionState, logger: Logger, messages:
 
   for (let i = 0; i < messages.length; i++) {
     if (elideWhole.has(i)) continue;
+    pushInjections(i); // summaries take the place of the elided span, before the end anchor
     const msg = messages[i];
     let kept = msg;
     if (stripIds.size > 0 && Array.isArray(msg.content)) {
@@ -100,10 +101,7 @@ export function applyCompressions(state: SessionState, logger: Logger, messages:
         return true;
       });
       if (filtered.length !== msg.content.length) {
-        if (filtered.length === 0) {
-          pushInjections(i);
-          continue;
-        }
+        if (filtered.length === 0) continue;
         kept = { ...msg, content: filtered };
       }
     }
@@ -111,7 +109,6 @@ export function applyCompressions(state: SessionState, logger: Logger, messages:
     if (i === firstUser) {
       out.push(syntheticText(SESSION_START_MARKER));
     }
-    pushInjections(i);
   }
 
   return out;

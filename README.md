@@ -33,14 +33,17 @@ prompt · work1 · add_anchor(a1) · work2 · add_anchor(a2) · compress(a1, a2,
 becomes, in the LLM-facing context:
 
 ```
-prompt · [anchor: session_start] · work1 · add_anchor(a2) · [Compressed: a1 → a2] desc
+prompt · [anchor: session_start] · work1 · [Compressed: a1 → a2] desc · add_anchor(a2)
 ```
 
 - Everything from the start anchor (inclusive) up to the end anchor
-  (exclusive) is replaced by the summary, injected right after the end anchor.
+  (exclusive) is replaced by the summary, which takes the span's place right
+  before the end anchor.
 - **The start anchor is consumed; the end anchor survives** — chain further
-  compressions from it: `compress(a2, a3, desc2)` absorbs the previous summary
-  (carry its key points into the new one).
+  compressions from it: `compress(a2, a3, desc2)` leaves earlier summaries in
+  place, so they accumulate in order (`desc1, desc2, …`). A new span that
+  fully contains a prior compressed span absorbs it — carry its key points
+  into the new summary.
 - The `compress` call itself is hidden from future context.
 - Invalid requests — unknown anchor, empty or reversed range, an end anchor
   already terminating or hidden inside an active compression, partial overlap —

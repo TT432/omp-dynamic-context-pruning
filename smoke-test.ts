@@ -232,7 +232,7 @@ const compressTool = createCompressTool({
   assert(appended.length === before + 1 && appended[before].customType === PERSIST_TYPE, "compress appended a dcp-state entry");
   assert(textOf(res).includes('Compressed "a1" → "a2"'), "compress result confirms the range");
 
-  // out = [prompt, MARKER, msg1, msg2, msg3'(text only), msg7, msg8, SUMMARY]
+  // out = [prompt, MARKER, msg1, msg2, msg3'(text only), SUMMARY, msg7, msg8]
   const out = applyCompressions(state, logger, clone(convo()));
   const render = JSON.stringify(out);
   assert(out.length === 8, `transform elides 3 + drops 2 stripped messages, injects marker + summary (got ${out.length})`);
@@ -245,8 +245,8 @@ const compressTool = createCompressTool({
   assert(render.includes("tu_a2"), "end anchor tool_use survives (kept for chaining)");
   assert(render.includes("[Compressed: a1 → a2]") && render.includes("D1: built feature X"), "summary injected with header");
   assert(!render.includes("tu_c1"), "compress call itself stripped from context");
-  assert(JSON.stringify(out[6]).includes("tu_a2"), "end anchor result message precedes the summary");
-  assert(JSON.stringify(out[7]).includes("[Compressed: a1 → a2]"), "summary injected right after the end anchor result");
+  assert(JSON.stringify(out[5]).includes("[Compressed: a1 → a2]"), "summary takes the place of the elided span, before the end anchor");
+  assert(JSON.stringify(out[6]).includes("tu_a2") && JSON.stringify(out[7]).includes("tu_a2"), "end anchor call and result follow the summary");
   assert(convo().length === 11 && !JSON.stringify(convo()).includes("[Compressed"), "transform never mutates the source conversation");
 }
 
@@ -270,15 +270,17 @@ const compressTool = createCompressTool({
     undefined,
     makeCtx(extended.slice(0, 14)),
   );
-  assert(state.blocks.length === 1 && state.blocks[0].id === 2, "chained compress consumes the prior block (only the new one survives)");
-  assert(textOf(res).includes("Absorbed 1 prior compression"), "result reports the absorbed compression");
+  assert(state.blocks.length === 2 && state.blocks[0].id === 1 && state.blocks[1].id === 2, "chained compress keeps both blocks — summaries accumulate");
+  assert(!textOf(res).includes("Absorbed"), "chaining absorbs nothing");
 
+  // out = [prompt, MARKER, msg1, msg2, msg3', SUMMARY1, msg7'(text only), SUMMARY2, msg13, msg14]
   const out = applyCompressions(state, logger, clone(extended));
   const render = JSON.stringify(out);
+  assert(render.includes("D1: built feature X"), "earlier chained summary stays in place");
   assert(render.includes("D2: phase two"), "new summary injected");
-  assert(!render.includes("D1: built feature X"), "consumed summary gone");
-  assert(!render.includes("tu_a2"), "consumed end anchor stripped once used as a start");
-  assert(render.includes("Feature X done."), "consumed anchor message keeps its text");
+  assert(render.indexOf("D1: built feature X") < render.indexOf("D2: phase two"), "summaries accumulate in order");
+  assert(!render.includes("tu_a2"), "shared anchor stripped once used as a start");
+  assert(render.includes("Feature X done."), "shared anchor message keeps its text");
   assert(render.includes("Marking a1."), "earlier consumed start text survives");
   assert(render.includes("tu_a3"), "new end anchor survives");
   assert(!render.includes("Second phase."), "chained span content elided");
@@ -302,15 +304,15 @@ const compressTool = createCompressTool({
   await tool2.execute("tu_c3", { startAnchor: "session_start", endAnchor: "b1", summary: "DS: early exploration done." }, undefined, undefined, makeCtx(mini.slice(0, 5)));
   assert(s2.blocks.length === 1 && s2.blocks[0].startToolUseId === null, "session_start block stores a null startToolUseId");
 
-  // out = [prompt, MARKER, anchor(b1), tr_b1, SUMMARY]
+  // out = [prompt, MARKER, SUMMARY, anchor(b1), tr_b1]
   const out = applyCompressions(s2, logger, clone(mini));
   const render = JSON.stringify(out);
-  assert(out.length === 5, `session_start compression keeps prompt + marker + end anchor pair + summary (got ${out.length})`);
+  assert(out.length === 5, `session_start compression keeps prompt + marker + summary + end anchor pair (got ${out.length})`);
   assert(render.includes("Original prompt."), "original prompt preserved");
   assert(render.includes("[anchor: session_start"), "session_start marker preserved (never consumed)");
   assert(!render.includes("tu_x1"), "post-prompt span elided");
-  assert(render.includes("tu_b1"), "end anchor survives");
-  assert(render.includes("[Compressed: session_start → b1]"), "summary header cites session_start");
+  assert(JSON.stringify(out[2]).includes("[Compressed: session_start → b1]"), "summary before the end anchor, header cites session_start");
+  assert(JSON.stringify(out[3]).includes("tu_b1"), "end anchor follows the summary");
   assert(!render.includes("tu_c3"), "compress call stripped");
 }
 

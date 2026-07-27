@@ -50,7 +50,8 @@ The context transform then applies every active block:
 - keep the end anchor untouched (**end anchor survives** for chaining);
 - strip the compress call itself (tool_use + tool_result, by `compressCallId`);
 - inject `[Compressed: start → end]\n<summary>` as a synthetic user message
-  right after the end anchor's tool_result message.
+  right **before** the end anchor's message — the summary takes the elided
+  span's place and the end anchor follows it.
 
 ### Chaining, absorption, and overlap rules
 
@@ -61,7 +62,7 @@ Given an existing block B `(bStartIdx, bEndIdx)` and a new range
 | --- | --- |
 | `bEnd == end` | reject — the anchor already ends an active compression; chain from it instead |
 | `end ∈ [bStart, bEnd)` | reject — the end anchor lies inside an active compression and cannot be guaranteed to survive |
-| `bEnd == start` | consume B — **chaining**: B ends exactly where the new range starts; its summary is positionally elided, so the model must carry key points into the new summary |
+| `bEnd == start` | keep B — **chaining**: B's summary sits before the new start anchor's message, outside the new span; summaries accumulate in order |
 | `bEnd ∈ (start, end)` and `bStart ≥ start` | consume B — fully contained, absorbed into the new summary |
 | `bEnd ∈ (start, end)` and `bStart < start` | reject — partial overlap |
 | otherwise | keep B |

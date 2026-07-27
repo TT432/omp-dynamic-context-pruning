@@ -34,7 +34,7 @@
     空消息整条删除）——**起点锚点被消耗**；整条删除 (startMsgIdx, endMsgIdx) 开区间内的消息。
   - 起点为 session_start：虚拟标记保留；整条删除 [firstUser+1, endMsgIdx) 内的消息。
   - **终点锚点保留**：endMsgIdx 消息及其 tool_result 不动。
-  - 摘要作为合成 user 消息注入在终点锚点的 tool_result 消息之后，
+  - 摘要作为合成 user 消息注入在终点锚点消息**之前**（占据被压缩区间的原位置），
     格式 `[Compressed {start} → {end}]\n{summary}`。
   - 本次 compress 调用本身（tool_use + tool_result，按 toolCallId）从未来上下文中剥除。
 - 校验（失败抛错，状态不变）：
@@ -43,8 +43,12 @@
   - 空区间（开区间内无消息）→ 报错；
   - endAnchor 已是某活跃压缩块的终点 → 报错（应从该锚点链式继续）；
   - 与活跃块部分重叠 → 报错。
-- 消耗规则：活跃块 B 的终点位置 ∈ [lo, hi)（lo = 真实起点 msgIndex 或 firstUser+1，hi = endMsgIdx）
-  → B 被新块吸收（删除 B；其摘要区域本就在新区间内，模型应在新 summary 中承接要点）。
+- 消耗/保留规则（lo = 真实起点 msgIndex 或 firstUser+1，hi = endMsgIdx）：
+  - 链式（活跃块 B 的终点 == 新起点）：**保留** B——其摘要位于新起点消息之前，不在新
+    区间内，摘要按序累加，形成有序记录；
+  - 完全包含（B 终点 ∈ (lo, hi) 且 B 起点 ≥ lo）：B 被新块吸收（删除 B；模型应在新
+    summary 中承接要点）；
+  - B 起点 < lo 且 B 终点 ∈ (lo, hi)：部分重叠 → 拒绝。
 - 后置条件：state.blocks 增加新块；被吸收块删除；dirty=true 并持久化。
 
 ### FR-4 context 钩子

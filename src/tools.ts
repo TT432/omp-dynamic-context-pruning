@@ -206,10 +206,6 @@ export function createCompressTool(deps: CompressToolDeps): ToolDefinition {
             `anchor "${endName}" is inside the active compression (${b.startName} → ${b.endName}); pick an endAnchor outside that span`,
           );
         }
-        if (bEndIdx === start.msgIndex) {
-          consumed.push(b); // chaining: b ends exactly where the new range starts
-          continue;
-        }
         if (bEndIdx > start.msgIndex && bEndIdx < end.msgIndex) {
           if (bStartIdx >= 0 && bStartIdx < start.msgIndex) {
             throw new Error(
@@ -219,6 +215,8 @@ export function createCompressTool(deps: CompressToolDeps): ToolDefinition {
           consumed.push(b); // fully contained — absorbed into the new summary
           continue;
         }
+        // bEndIdx === start.msgIndex (chaining) keeps b: its summary sits before
+        // the start anchor's message, outside the new span — summaries accumulate.
       }
 
       const block: CompressionBlock = {
