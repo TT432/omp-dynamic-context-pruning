@@ -1,7 +1,7 @@
 {
   "name": "@local/omp-dcp",
   "version": "0.1.0",
-  "description": "Dynamic Context Pruning for Oh My Pi (omp) — model-driven, surgical conversation compression and automatic context cleanup.",
+  "description": "Anchor-based conversation compression for Oh My Pi (omp) — model-driven add_anchor + compress tools, lossless session history.",
   "license": "AGPL-3.0-or-later",
   "type": "module",
   "omp": {
@@ -13,8 +13,5 @@
   "devDependencies": {
     "@types/node": "^26.1.0",
     "typescript": "^6.0.3"
-  },
-  "peerDependencies": {
-    "@oh-my-pi/pi-coding-agent": "*"
   }
 }

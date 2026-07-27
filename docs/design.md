@@ -1,189 +1,130 @@
-# DCP for omp — Design
+# DCP for omp — Design (anchor mode)
 
-Dynamic Context Pruning for Oh My Pi, modeled on
-[Opencode-DCP/opencode-dynamic-context-pruning](https://github.com/Opencode-DCP/opencode-dynamic-context-pruning).
+Dynamic Context Pruning for Oh My Pi, distilled to a single mechanism:
+**model-driven compression of conversation spans delimited by named anchors**.
+Originally modeled on
+[Opencode-DCP/opencode-dynamic-context-pruning](https://github.com/Opencode-DCP/opencode-dynamic-context-pruning);
+the automatic strategies, nudges, commands, and config system were removed in
+favor of explicit, model-placed anchors.
 
 ## Core invariant
 
 **Session history is never modified.** DCP only transforms the *copy* of the
-conversation sent to the LLM on each provider request. Compressed ranges are
-replaced with summaries; superseded / errored tool content is replaced with
-placeholders. The persisted session stays byte-for-byte intact.
+conversation sent to the LLM on each provider request (omp's `context` event;
+verified LLM-only in `pi-agent-core/src/agent-loop.ts`). Compressed spans are
+replaced with summaries; the persisted session stays byte-for-byte intact.
 
-omp gives exactly the right hook for this: the `context` event returns
-`{ messages }`, replacing the messages array for **a single LLM call only**.
-This is the heart of the plugin and the direct analogue of DCP's
-`experimental.chat.messages.transform`.
+## Anchors
 
-## API surface mapping (OpenCode plugin → omp extension)
+An anchor is a named position in the conversation:
 
-| DCP (OpenCode)                        | omp extension                                              |
-| ------------------------------------- | ---------------------------------------------------------- |
-| `experimental.chat.messages.transform`| `pi.on("context", ...)` → `{ messages }`                   |
-| `experimental.chat.system.transform`  | system-prompt append via injected custom message + tool description |
-| `tool.compress`                       | `pi.registerTool({ name: "compress" })`                    |
-| `command.execute.before`              | `pi.registerCommand(...)`                                  |
-| `event`                               | `pi.on("session_start" / "tool_result" / ...)`             |
-| `ctx.client.session.*` state          | `pi.appendEntry(...)` + `ctx.sessionManager.getBranch()`   |
+- A **real anchor** is an `add_anchor` tool call. Its identity is the
+  provider-assigned `tool_use.id` — globally unique, persisted, never mutated.
+  No content signatures, no substring matching: resolution is an exact scan of
+  the message array. Names are unique per session (the tool rejects duplicates,
+  excluding its own in-flight call) and `session_start` is reserved.
+- **`session_start`** is a virtual anchor the transform injects right after the
+  first user message (role `user` without `tool_result` blocks — the original
+  prompt). It is never consumed and is always available as a `startAnchor`.
 
-## The compress tool does NOT call an LLM
+## compress semantics
 
-Critical design point. In DCP the compress tool's schema requires the model to
-provide the `summary` text itself:
+`compress({ startAnchor, endAnchor, summary })` resolves both anchors on the
+persisted branch (`ctx.sessionManager.getBranch()`), validates, and records a
+compression block:
 
+```ts
+{
+  id, startName, startToolUseId /* null = session_start */,
+  endName, endToolUseId, summary, compressCallId, createdAt
+}
 ```
-content: [{ startId, endId, summary: "Complete technical summary..." }]
-```
 
-The model that has the context writes its own compression summary. The tool
-only validates ranges, appends protected content, and stores a compression
-block. No one-shot LLM call is needed from inside the extension — and omp does
-not export `completeSimple` to extensions anyway. This removes the only
-plausible blocker for the port.
+The context transform then applies every active block:
 
-## Message identity without stable message IDs
+- whole-elide messages in `(startMsgIdx, endMsgIdx)` — for `session_start`
+  starts, `[firstUser+1, endMsgIdx)`;
+- strip the start anchor's `add_anchor` tool_use/tool_result blocks (**start
+  anchor consumed**; non-anchor content of the same message is kept, empty
+  messages are dropped);
+- keep the end anchor untouched (**end anchor survives** for chaining);
+- strip the compress call itself (tool_use + tool_result, by `compressCallId`);
+- inject `[Compressed: start → end]\n<summary>` as a synthetic user message
+  right after the end anchor's tool_result message.
 
-DCP keys everything on `message.info.id` (OpenCode assigns every message a
-stable id). omp's `AgentMessage` has **no id field**; the id lives on the
-session *entry*, not the message, and the `context` event delivers plain
-`AgentMessage[]`.
+### Chaining, absorption, and overlap rules
 
-Resolution: derive a stable identity from content.
+Given an existing block B `(bStartIdx, bEndIdx)` and a new range
+`[start, end)`:
 
-- A message with ≥1 `tool_use` block → identity = `"tu:" + tool_use.id`
-  (provider-assigned, globally unique, persisted, never mutated).
-- A message with only text/other blocks → identity = a content signature of
-  `role + text`, disambiguated by ordinal among same-signature messages.
-- `tool_result` blocks are identified by their `tool_use_id` (pairs with the
-  matching `tool_use`).
+| Situation | Rule |
+| --- | --- |
+| `bEnd == end` | reject — the anchor already ends an active compression; chain from it instead |
+| `end ∈ [bStart, bEnd)` | reject — the end anchor lies inside an active compression and cannot be guaranteed to survive |
+| `bEnd == start` | consume B — **chaining**: B ends exactly where the new range starts; its summary is positionally elided, so the model must carry key points into the new summary |
+| `bEnd ∈ (start, end)` and `bStart ≥ start` | consume B — fully contained, absorbed into the new summary |
+| `bEnd ∈ (start, end)` and `bStart < start` | reject — partial overlap |
+| otherwise | keep B |
 
-This identity is stable across context rebuilds because omp never mutates
-`tool_use.id`, `tool_use.input`, user text, or assistant text — it only prunes
-`tool_result` *content*, which is excluded from the signature.
+Invariants these rules preserve:
 
-Flow (content anchors — see "Why not tags" below):
+- **INV-1** distinct surviving blocks have distinct end anchors.
+- **INV-2** a surviving block's end anchor and summary injection point are
+  never elided by another surviving block.
+- **INV-4** a failed compress (thrown validation) mutates no state.
 
-1. Model calls `compress({ content: [{ startAnchor, endAnchor, summary }] })`,
-   quoting short verbatim phrases from the first / last message of the range.
-2. Compress tool substring-matches each anchor (whitespace- and
-   case-normalized) to a message — rejecting it as ambiguous if it matches more
-   than one — resolves the span, and stores a compression block keyed by the
-   span's message identities + tool ids.
-3. Future `context` passes recompute identities, elide messages belonging to an
-   active compression block, and inject the summary at the earliest effective
-   message.
-
-## Why not per-message tags (an omp constraint)
-
-Upstream DCP tags every message with `<dcp-message-id>m####</dcp-message-id>`
-and strips hallucinated tags via a `text.complete` hook. **omp has no
-output-mutation hook** — every `message_*` lifecycle event is notification-only
-(verified in `pi-coding-agent/src/extensibility/extensions/types.ts`). So
-tag injection is unsafe here: the model imitates the tag pattern into its own
-output, which is then persisted and displayed with no way to strip it. Content
-anchors inject nothing, so there is nothing to imitate. The `context` event
-itself is LLM-only (verified in `pi-agent-core/src/agent-loop.ts`: transform
-output flows to `llmMessages` and is never written back to storage/display).
+Tool_use/tool_result pairs are always stripped together (no orphan blocks);
+messages left empty are dropped.
 
 ## Modules
 
 ```
-index.ts                 extension factory entry; wires hooks/tools/commands
+index.ts        extension factory: registers context handler, lifecycle, tools
 src/
-  omp.d.ts               ambient declarations for the omp API surface used
-  config.ts              config model, defaults, validation, JSON-schema load
-  logger.ts              debug logger writing under ~/.omp/agent/logs/dcp
-  token-utils.ts         token estimation (chars/4 fallback)
-  state/
-    types.ts             SessionState, CompressionBlock, PruneMessagesState…
-    state.ts             createSessionState factory
-    persistence.ts       serialize/save/load via pi.appendEntry (custom entries)
-    utils.ts             block allocation, summary wrapping, isMessageCompacted
-  messages/
-    shape.ts             omp AgentMessage content-block helpers (typed accessors)
-    identity.ts          stable content-signature identity + m-ref assignment
-    query.ts             user-message / tool-metadata extraction
-    prune.ts             the context-hook core: placeholder + summary injection
-    nudge.ts             compress nudge injection (context-limit / turn / iteration)
-  strategies/
-    deduplication.ts     drop older identical tool calls, keep most recent
-    purge-errors.ts      drop errored tool inputs after N turns
-  compress/
-    range.ts             compress tool (range mode)
-    range-utils.ts       range resolution, nesting, placeholder handling
-    protected-content.ts append protected tool outputs / user msgs to summaries
-    types.ts             shared compress types
-  prompts/
-    system.ts            system-prompt block describing the compress tool
-    compress-range.ts    the compress tool description + format extension
-    nudge.ts             nudge prompt bodies
-  protected-patterns.ts  glob matching for protected tools / file paths
-  hooks.ts               context/system/event/turn handlers
-  commands.ts            /dcp, /dcp-compress, /dcp stats, /dcp context
+  omp.d.ts      ambient declarations for the omp API surface used
+  anchors.ts    anchor model: scanAnchors, session_start, tool_use/result lookup
+  state.ts      SessionState, CompressionBlock, dcp-state (v2) persistence
+  tools.ts      add_anchor + compress tool factories
+  transform.ts  the context-transform heart: elide / strip / inject
+  hooks.ts      session lifecycle: bind, flush, compact, context handler
+  prompts.ts    tool descriptions, marker + summary formats
+  logger.ts     debug logger (~/.omp/agent/logs/dcp, DCP_DEBUG=1)
+smoke-test.ts   bun smoke test over synthetic omp messages
 ```
 
-## Session lifecycle (omp-accurate)
-
-omp's extension events (from `shared-events.d.ts`) drive binding. DCP does **not**
-trust event payloads for session id or model window — those live on `ctx`:
-
-| Need | Source |
-| ---- | ------ |
-| Session id | `ctx.sessionManager.getSessionId()` (fallback: `getSessionFile()`) |
-| Context window | `ctx.model.contextWindow` (fallback: `ctx.getContextUsage()?.limit`) |
-| Durable state | latest `custom` entry with `customType: "dcp-state"` on `getBranch()` |
-
-### Handlers
+## Session lifecycle
 
 | Event | Action |
 | ----- | ------ |
-| `session_start` | `bindSession`: reset if id changed → load `dcp-state` → sync model window → one-shot system inject |
-| `session_before_switch` | `flushSessionState` into the **current** session file (still bound) |
-| `session_switch` | `bindSession` for the new session (reason: new/resume/fork/handoff) |
-| `session_compact` | clear compression blocks (identities invalid) + persist cleared state |
-| `session_shutdown` | flush if dirty |
-| `context` | lazy-bind if unbound; sync model; reconcile compaction via branch timestamps; prune pipeline |
-| `turn_end` | sync model window only |
+| `session_start` / `session_switch` | bind: reset if the session id changed, load latest `dcp-state` entry, track latest compaction timestamp |
+| `session_before_switch` / `session_shutdown` | flush dirty state into the current session |
+| `session_compact` | clear all blocks (anchors may be compacted away) + persist the cleared state |
+| `context` | lazy-bind if unbound; reconcile omp-side compaction by branch timestamps; clone → transform → return |
 
-### Dirty / persist
+Same-session re-bind is a no-op, so in-flight compress state is never wiped.
 
-- `state.dirty` marks durable divergence from the last `dcp-state` entry.
-- Set dirty on: successful compress, manual-mode toggle, compaction clear.
-- Flushed on: compress, manual toggle, `session_before_switch`, `session_shutdown`, post-compact.
-- `loadSessionState` never overwrites the live `sessionId` or a already-synced
-  `modelContextLimit` (serialized values are advisory).
+## Persistence
 
-### Same-session re-bind
+Only compression blocks are durable — anchors re-derive from history by
+scanning. State rides omp custom entries (`customType: "dcp-state"`, `v: 2`);
+the latest entry on the active branch wins. v1 entries (range-mode era) are
+ignored. Blocks whose anchors no longer resolve at transform time
+(fork/compaction residue) are dropped lazily and the state marked dirty so the
+next flush persists the cleanup.
 
-`bindSession` is a no-op when the resolved id equals `state.sessionId`, so a
-redundant `session_start` after an in-flight compress cannot wipe blocks.
+## Errors surface to the model
 
+Both tools fail by throwing — the model sees the error tool_result and no
+state changes. Unknown-anchor errors list the available anchors so the model
+can recover immediately.
 
-## Faithfulness vs. deferral
+## Deliberately removed (vs. the range-mode port)
 
-Implemented (production core):
-- `context` transform (placeholdering + summary injection) — the heart
-- compress tool, range mode (model-authored summaries, nested blocks incl.
-  boundary-block fold-in when a range starts/ends on an existing block)
-- strategies: deduplication, purge-errors
-- system-prompt injection + context-limit / turn / iteration nudges
-- protected tools + protected file patterns
-- protected-content appended into compression summaries
-- compress notifications via `ctx.ui.notify` (off/minimal/detailed)
-- config system (`dcp.jsonc` with layered global/project discovery)
-- state persistence across sessions via custom entries
-- slash commands: `/dcp`, `/dcp-compress [focus]`, `/dcp stats`, `/dcp context`
-
-Deferred / consciously omitted:
-- compress `message` mode — experimental upstream; range mode is the
-  production default. Tracked for follow-up.
-- per-compress permission prompt — OpenCode's `ask` flow; declined (auto preferred).
-- subagent-result extension in protected content — subagents are out of scope
-  (`experimental.allowSubAgents` defaults false).
-- manual-mode gating inside the compress tool — declined (manual mode unused).
-- compress timing/duration tracking — cosmetic; declined.
-- TUI panel — OpenCode's panel system is host-specific; omp commands cover the
-  same surface.
-- npm auto-update — the plugin is local/source-installed; updates are manual.
-- `/dcp sweep`, `recompress`, `decompress` — secondary commands; the state model
-  supports them and they can be added without redesign.
+- deduplication / purge-errors strategies and all nudges — compression is
+  explicit now;
+- slash commands, prune notifications, protected tools/file patterns,
+  protected-content append, system-prompt injection;
+- the layered `dcp.jsonc` config system (no configuration remains; debug is
+  `DCP_DEBUG`);
+- content-signature message identity and verbatim-phrase anchor resolution —
+  named anchors make both unnecessary.
