@@ -26,7 +26,7 @@ export interface CompressionBlock {
   endToolCallId: string;
   /** Model-authored summary replacing the span. */
   summary: string;
-  /** tool-call id of the compress call itself (stripped from future context). */
+  /** tool-call id of the compress call itself (kept in context; recorded for traceability). */
   compressCallId: string;
   createdAt: number;
 }

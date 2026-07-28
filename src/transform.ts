@@ -8,7 +8,9 @@
  *     starts, [firstUser+1, endMsgIdx);
  *   - the start anchor's add_anchor toolCall block and its toolResult message
  *     are stripped (start anchor consumed; session_start is virtual and kept);
- *   - the compress call itself (toolCall + toolResult, by id) is stripped;
+ *   - the compress call itself and its toolResult are kept — the success
+ *     confirmation staying in context tells future turns the compression
+ *     happened;
  *   - the summary is injected right before the end anchor's message — it
  *     takes the place of the elided span, and the end anchor follows it.
  *     Chained blocks (new start = old end) therefore accumulate summaries
@@ -76,7 +78,6 @@ export function applyCompressions(state: SessionState, logger: Logger, messages:
   for (const r of resolved) {
     for (let i = r.lo; i < r.hi; i++) elideWhole.add(i);
     if (r.block.startToolCallId !== null) stripIds.add(r.block.startToolCallId);
-    stripIds.add(r.block.compressCallId);
     const list = injectBefore.get(r.hi) ?? [];
     list.push(r.block);
     injectBefore.set(r.hi, list);

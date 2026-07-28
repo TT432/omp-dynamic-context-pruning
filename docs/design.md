@@ -70,7 +70,8 @@ The context transform then applies every active block:
   message (**start anchor consumed**; non-anchor content of the same message is
   kept, empty messages are dropped);
 - keep the end anchor untouched (**end anchor survives** for chaining);
-- strip the compress call itself (toolCall + toolResult, by `compressCallId`);
+- keep the compress call itself and its toolResult in context — the success
+  confirmation is the visible record that the compression happened;
 - inject `[Compressed: start → end]\n<summary>` as a synthetic user message
   right **before** the end anchor's message — the summary takes the elided
   span's place and the end anchor follows it.

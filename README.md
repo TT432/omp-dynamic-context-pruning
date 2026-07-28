@@ -44,7 +44,8 @@ prompt · [anchor: session_start] · work1 · [Compressed: a1 → a2] desc · ad
   place, so they accumulate in order (`desc1, desc2, …`). A new span that
   fully contains a prior compressed span absorbs it — carry its key points
   into the new summary.
-- The `compress` call itself is hidden from future context.
+- The `compress` call and its success confirmation stay in context, so later
+  turns can see that the compression happened.
 - Invalid requests — unknown anchor, empty or reversed range, an end anchor
   already terminating or hidden inside an active compression, partial overlap —
   fail with an error and change nothing.
