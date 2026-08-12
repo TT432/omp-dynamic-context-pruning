@@ -1,18 +1,17 @@
-# omp-dcp — anchors + SkillZip for omp
+# omp-dcp — anchor-based conversation compression
 
-An [Oh My Pi (omp)](https://omp.ai) extension with two independent mechanisms:
-
-- model-driven compression of conversation spans delimited by named anchors,
-  without modifying session history; and
-- evaluation-free persistent skill evolution based on the SkillZip typed-contract
-  and hard-coverage design (arXiv:2608.11079).
+Dynamic Context Pruning for [Oh My Pi (omp)](https://omp.ai), distilled to one
+mechanism: **model-driven compression of conversation spans delimited by named
+anchors** — without ever modifying session history. All transforms happen on
+the copy of the conversation bound for the LLM; the persisted session stays
+byte-for-byte intact.
 
 Because omp counts context from the provider's real prompt-token report, the
 savings are real: the context bar drops and omp's auto-compaction is deferred.
 
-## Anchor compression
+## What it does
 
-Two anchor tools are exposed to the model:
+Two tools are exposed to the model:
 
 - **`add_anchor({ anchor })`** — places a named anchor at the call site. The
   tool call itself is the anchor: its provider-assigned tool-call id is a
@@ -74,33 +73,6 @@ Compared to quoting verbatim text anchors (the previous design), named anchors
 are unambiguous by construction — no substring matching, no ambiguity
 rejection, no drift when messages change.
 
-## SkillZip evolution
-
-The essential **`skillzip`** tool supports `create`, `update`, `compress`,
-`audit`, `inspect`, `status`, and `list`. It stores deployable skills at
-`~/.omp/agent/skillzip/<name>/SKILL.md`, with a private `.skillzip.json`
-typed-contract sidecar and crash-recovery WAL in the same directory.
-
-SkillZip runs without global `AGENTS.md` evolution rules. The extension itself:
-
-1. appends a stable evolution contract in `before_agent_start`;
-2. offers one hidden capture continuation after a substantive turn (five
-   successful tool calls), while allowing explicit calls at any time;
-3. scans Markdown into stable cited blocks and asks a configured `@smol` model
-   only for schema-constrained contract extraction;
-4. validates citations, workflow edges, tool names/arguments, scopes, and
-   modality in the host;
-5. deterministically deduplicates compatible rules, lifts rules only when every
-   direct child scope is covered, and extracts repeated workflows only when the
-   rendered token saving is positive;
-6. renders an ordinary `SKILL.md`, audits every required unit, restores the
-   shortest cited source block if coverage is missing, then atomically commits
-   text and sidecar.
-
-Unique, rare, ambiguous, code, and table content is never discarded merely for
-being infrequent. If no model is available or extraction fails, every source
-block becomes locked residual and is preserved verbatim.
-
 ## Installation
 
 This is a source extension (a directory with `package.json` declaring
@@ -112,7 +84,7 @@ extensions:
   - /path/to/omp-dcp
 ```
 
-Restart omp. The model gets `add_anchor`, `compress`, and the essential `skillzip` tool. `create` and `update` ask live hosts to reload resources; otherwise the skill is discovered on the next omp start.
+Restart omp. The model gets the `add_anchor` and `compress` tools.
 
 ## Configuration
 
@@ -121,11 +93,11 @@ and structured logs under `~/.omp/agent/logs/dcp/`.
 
 ## Verification
 
-- `bun run typecheck` — type-checks the extension and both smoke suites.
-- `bun run test` — runs the existing anchor pipeline regression suite plus
-  SkillZip scanner, extraction validation, hard coverage, compatible sharing,
-  Zip-on-Write, fallback, audit recovery, transaction rollback, path safety,
-  and AGENTS-independent lifecycle contracts.
+- `bunx tsc --noEmit` — type-checks clean.
+- `bun smoke-test.ts` — exercises the full pipeline (anchor scanning, both
+  tools, transform, chaining/consumption, session_start, validation errors,
+  persistence round trip, session lifecycle, orphan cleanup) against synthetic
+  omp messages.
 
 See [`docs/design.md`](./docs/design.md) for the architecture and invariants.
 

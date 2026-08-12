@@ -16,5 +16,5 @@
     "noEmit": true,
     "types": ["node"]
   },
-  "include": ["index.ts", "smoke-test.ts", "skillzip-smoke-test.ts", "extension-smoke-test.ts", "src/**/*.ts"]
+  "include": ["index.ts", "src/**/*.ts"]
 }

@@ -1,22 +1,17 @@
 {
   "name": "@local/omp-dcp",
-  "version": "0.2.0",
-  "description": "Oh My Pi extension for anchor-based conversation compression and evaluation-free SkillZip skill evolution.",
+  "version": "0.1.0",
+  "description": "Anchor-based conversation compression for Oh My Pi (omp) — model-driven add_anchor + compress tools, lossless session history.",
   "license": "AGPL-3.0-or-later",
   "type": "module",
   "omp": {
     "extensions": ["./index.ts"]
   },
   "scripts": {
-    "typecheck": "tsc --noEmit",
-    "test": "bun smoke-test.ts && bun skillzip-smoke-test.ts && bun extension-smoke-test.ts"
+    "typecheck": "tsc --noEmit"
   },
   "devDependencies": {
     "@types/node": "^26.1.0",
     "typescript": "^6.0.3"
-  },
-  "dependencies": {
-    "@oh-my-pi/omptype": "17.2.13",
-    "@oh-my-pi/pi-ai": "17.2.13"
   }
 }
