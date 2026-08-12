@@ -1,13 +1,7 @@
 /**
- * DCP for omp — anchor-based conversation compression.
- *
- * Default-exported factory; omp loads this module and calls it with the live
- * `ExtensionAPI`. Two tools are registered:
- *   - add_anchor: place a named anchor at the call site;
- *   - compress:   replace the span between two anchors with a model-authored
- *                 summary (start anchor consumed, end anchor kept for chaining).
- * The context handler applies compression blocks to the outgoing message copy
- * on every LLM request. Session storage is never modified.
+ * DCP for omp: anchor-based conversation compression plus SkillZip persistent
+ * skill evolution. Anchor transforms never modify history; SkillZip writes
+ * only through its managed, audited transaction.
  */
 
 import type { ExtensionAPI } from "./src/omp";
@@ -22,6 +16,9 @@ import {
   createSessionSwitchHandler,
 } from "./src/hooks";
 import { createAddAnchorTool, createCompressTool } from "./src/tools";
+import { createSkillZipTool } from "./src/skillzip/tool";
+import { registerSkillZipLifecycle } from "./src/skillzip/hooks";
+import { listSkills, managedRoot } from "./src/skillzip/store";
 
 export default function dcpExtension(pi: ExtensionAPI): void {
   const debugEnv = typeof process !== "undefined" ? (process.env.DCP_DEBUG ?? "") : "";
@@ -53,5 +50,17 @@ export default function dcpExtension(pi: ExtensionAPI): void {
     }),
   );
 
-  logger.info("DCP initialized (anchor mode)");
+  // Self-contained persistent evolution; does not depend on AGENTS.md.
+  const skillRoot = managedRoot();
+  pi.registerTool(createSkillZipTool({ pi, logger }));
+  registerSkillZipLifecycle(pi, skillRoot);
+  pi.registerCommand("skillzip", {
+    description: "Show SkillZip managed-skill status",
+    async handler(_args, ctx): Promise<void> {
+      const skills = await listSkills();
+      ctx.ui.notify(skills.length ? `${skills.length} SkillZip skill(s): ${skills.map((skill) => skill.name).join(", ")}` : `No SkillZip skills under ${skillRoot}`, "info");
+    },
+  });
+
+  logger.info("DCP initialized (anchor + SkillZip modes)");
 }

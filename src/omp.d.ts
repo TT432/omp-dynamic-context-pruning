@@ -1,3 +1,5 @@
+import type { ApiKey, Model } from "@oh-my-pi/pi-ai";
+
 /**
  * Ambient declarations for the Oh My Pi (omp) extension API surface that this
  * plugin depends on. Sourced from the omp internal docs
@@ -116,10 +118,22 @@ export interface ExtensionContext {
   hasUI: boolean;
   cwd: string;
   sessionManager: SessionManager;
-  /** Live session model; contextWindow is the authoritative window size. */
-  model?: { id?: string; contextWindow?: number; [k: string]: unknown };
+  /** Live session model and authenticated model facade. */
+  model?: Model;
+  models?: {
+    list(): Model[];
+    current(): Model | undefined;
+    resolve(spec: string): Model | undefined;
+    family?(model: Model): string;
+  };
+  modelRegistry?: {
+    resolver(model: Model, sessionId?: string): ApiKey;
+  };
   /** Optional usage snapshot; `limit` is a fallback window when model is unset. */
   getContextUsage?(): { tokens?: number; limit?: number } | undefined;
+  getSystemPrompt?(): string[];
+  /** Present in command contexts and some live extension hosts. */
+  reload?(): Promise<void>;
   isIdle(): boolean;
 }
 
@@ -140,6 +154,9 @@ export interface ToolDefinition {
   parameters: unknown;
   hidden?: boolean;
   defaultInactive?: boolean;
+  loadMode?: "essential" | "discoverable" | "hidden";
+  approval?: "read" | "write" | "exec";
+  strict?: boolean;
   execute(
     toolCallId: string,
     params: unknown,
@@ -213,6 +230,34 @@ export interface TurnEndEvent {
   message?: AgentMessage;
   toolResults?: unknown[];
 }
+export interface BeforeAgentStartEvent {
+  type: "before_agent_start";
+  prompt: string;
+  systemPrompt: string[];
+}
+
+export interface ToolExecutionEndEvent {
+  type: "tool_execution_end";
+  toolCallId: string;
+  toolName: string;
+  result: unknown;
+  isError: boolean;
+}
+
+export interface SessionStopEvent {
+  type: "session_stop";
+  messages: AgentMessage[];
+  turn_id: number;
+  session_id: string;
+  stop_hook_active: boolean;
+  signal: AbortSignal;
+}
+
+export interface ResourcesDiscoverEvent {
+  type: "resources_discover";
+  cwd: string;
+  reason: "startup" | "reload";
+}
 
 // ---------------------------------------------------------------------------
 // Zod-like schema (omp injects zod/v4)
@@ -221,6 +266,7 @@ export interface TurnEndEvent {
 export interface ZodSchema<T = unknown> {
   _def: unknown;
   _type?: T;
+  optional(): ZodSchema<T | undefined>;
 }
 
 export interface ZodNamespace {
@@ -230,12 +276,7 @@ export interface ZodNamespace {
   array: <T>(schema: ZodSchema<T>) => ZodSchema<T[]>;
   object: <T extends Record<string, ZodSchema>>(shape: T) => ZodSchema<object>;
   enum: <T extends string>(values: readonly T[], opts?: { description?: string }) => ZodSchema<T>;
-  optional: <T>(schema: ZodSchema<T>) => ZodSchema<T | undefined>;
 }
-
-// ---------------------------------------------------------------------------
-// Extension API (injected into the default-exported factory)
-// ---------------------------------------------------------------------------
 
 export interface ExtensionAPI {
   zod: ZodNamespace;
@@ -252,9 +293,14 @@ export interface ExtensionAPI {
   on(event: "tool_result", handler: (event: ToolResultEvent, ctx: ExtensionContext) => Promise<Partial<ToolResult> | void> | Partial<ToolResult> | void): void;
   on(event: "turn_end", handler: (event: TurnEndEvent, ctx: ExtensionContext) => Promise<void> | void): void;
   on(event: "message_end", handler: (event: unknown, ctx: ExtensionContext) => Promise<void> | void): void;
+  on(event: "resources_discover", handler: (event: ResourcesDiscoverEvent, ctx: ExtensionContext) => Promise<{ skillPaths?: string[] } | void> | { skillPaths?: string[] } | void): void;
+  on(event: "before_agent_start", handler: (event: BeforeAgentStartEvent, ctx: ExtensionContext) => Promise<{ systemPrompt?: string[] } | void> | { systemPrompt?: string[] } | void): void;
+  on(event: "tool_execution_end", handler: (event: ToolExecutionEndEvent, ctx: ExtensionContext) => Promise<void> | void): void;
+  on(event: "session_stop", handler: (event: SessionStopEvent, ctx: ExtensionContext) => Promise<{ continue?: boolean; additionalContext?: string } | void> | { continue?: boolean; additionalContext?: string } | void): void;
   on(event: string, handler: (...args: unknown[]) => unknown): void;
 
   registerTool(definition: ToolDefinition): void;
+  getAllTools?(): Array<{ name: string; description: string; parameters: unknown }>;
 
   registerCommand(
     name: string,
@@ -268,7 +314,7 @@ export interface ExtensionAPI {
   appendEntry(customType: string, data: unknown): Promise<void> | void;
 
   /** Inject a custom message into the live conversation. */
-  sendCustomMessage?(message: { customType: string; content: string | ContentBlock[]; display?: boolean; attribution?: "user" | "agent" }, options?: { deliverAs?: "steer" | "followUp" | "nextTurn"; triggerTurn?: boolean }): Promise<void> | void;
+  sendMessage?(message: { customType: string; content: string | ContentBlock[]; display?: boolean; attribution?: "user" | "agent" }, options?: { deliverAs?: "steer" | "followUp" | "nextTurn"; triggerTurn?: boolean }): Promise<void> | void;
 
   /** Package exports (full omp surface). */
   pi: Record<string, unknown>;

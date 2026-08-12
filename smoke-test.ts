@@ -102,9 +102,10 @@ function makeCtx(messages: AgentMessage[], sessionId = "sess-1"): ExtensionConte
 
 // Minimal zod stand-in: the tool factories only build the parameter schema at
 // registration time; execute() re-validates fields itself.
+const schemaStub = { optional() { return this; } };
 const zodStub = {
-  object: (shape: unknown) => ({ shape }),
-  string: () => ({}),
+  object: (shape: unknown) => ({ shape, ...schemaStub }),
+  string: () => ({ ...schemaStub }),
 } as unknown as ExtensionAPI["zod"];
 
 function makePi(appended: { customType: string; data: unknown }[]): ExtensionAPI {
@@ -436,7 +437,7 @@ const compressTool = createCompressTool({
   s5.dirty = true;
   const app: { customType: string; data: unknown }[] = [];
   saveSessionState(makePi(app), s5);
-  assert(app.length === 1 && s5.dirty === false, "save appends one entry and clears dirty");
+  assert(app.length === 1 && !s5.dirty, "save appends one entry and clears dirty");
 
   const branch: SessionEntry[] = [
     { type: "custom", id: "c1", parentId: null, timestamp: new Date().toISOString(), customType: PERSIST_TYPE, data: app[0].data },
@@ -524,7 +525,7 @@ const compressTool = createCompressTool({
   });
   s9.dirty = false;
   const out2 = applyCompressions(s9, logger, clone(msgs));
-  assert(s9.blocks.length === 1 && s9.dirty === true, "orphan block dropped at transform time and marked dirty");
+  assert(s9.blocks.length === 1 && Boolean(s9.dirty), "orphan block dropped at transform time and marked dirty");
   assert(!JSON.stringify(out2).includes("ghost"), "orphan summary never injected");
 }
 

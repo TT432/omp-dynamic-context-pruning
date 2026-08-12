@@ -163,3 +163,108 @@ can recover immediately.
   `DCP_DEBUG`);
 - content-signature message identity and verbatim-phrase anchor resolution —
   named anchors make both unnecessary.
+
+## SkillZip persistent evolution
+
+SkillZip is an independent subsystem beside anchor compression. It implements
+the structural core of *SkillZip: Evaluation-Free Skill Compression for
+Self-Evolving Agents* (arXiv:2608.11079): explain reusable structure once,
+retain genuine differences explicitly, and require hard coverage of every
+extracted operational unit. It never reads `AGENTS.md` to obtain its behavior.
+
+### Runtime contract
+
+- `before_agent_start` appends the extension-owned evolution contract on every
+  primary turn.
+- `tool_execution_end` counts successful non-maintenance calls.
+- `session_stop` requests at most one hidden capture continuation after five
+  successful calls. The continuation may propose only knowledge validated in
+  the completed turn; persistence still requires the `skillzip` tool.
+- `/skillzip` reports managed artifacts. Successful create/update requests a live
+  resource reload when the host exposes it; otherwise the next start discovers it.
+
+This makes triggering self-contained while leaving the main model responsible
+for the semantic decision that a completed procedure is reusable.
+
+### Typed contract and pipeline
+
+`src/skillzip/types.ts` represents interface, scope tree, workflow nodes and
+edges, tool protocol, scoped rules, output fields and termination, evidence,
+locked residuals, shared procedures, source provenance, coverage, optimizer
+candidates, and update history.
+
+The write path is:
+
+```
+Markdown scan → structured extraction → host validation → deterministic MDL
+optimization → portable render → independent coverage audit → WAL commit
+```
+
+The scanner makes frontmatter, fences, and tables atomic and gives every block
+a stable SHA-256-derived id over normalized text and ancestor headings. The
+model may only return a schema-constrained contract with citations. The host
+rejects unknown spans/scopes/edges/tool arguments and preserves each affected
+source block as locked residual. Model absence or failure therefore degrades to
+zero compression, not knowledge loss.
+
+The deterministic optimizer accepts only exact compatible sharing:
+
+- rules require identical type, modality, namespace, scope family, guard, and
+  normalized predicate;
+- lifting requires the same rule in every direct child of a parent scope;
+- workflows require exact scope/kind/action/tool/argument signatures, two
+  non-overlapping occurrences, compatible edges, and positive approximate
+  rendered-token saving.
+
+Zip-on-Write extracts an accepted patch separately. Exact compatible units are
+`ABSORB`; all others are `EXTEND`; a subsequent global deterministic pass
+performs representation-level refactoring. Patch block ids are namespaced by
+the patch hash so provenance cannot collide with prior rounds.
+
+### Hard coverage and audit
+
+Every trigger/exclusion, workflow unit, scoped rule, output field/termination,
+unique evidence item, and residual block has a coverage record. Rendering adds
+machine-readable HTML markers but the audit also checks represented text; a
+marker alone cannot fake coverage. Missing units recover the shortest cited
+source block into locked residual and the artifact is audited again. An
+unrepaired result is never committed.
+
+### Storage and transaction invariants
+
+Each managed skill owns:
+
+```
+~/.omp/agent/skillzip/<name>/
+  SKILL.md          portable deployed artifact
+  .skillzip.json    typed sidecar and provenance
+  .skillzip.wal.json (only while committing/recovering)
+```
+
+- **SZ-1** Only lowercase kebab-case children of the managed root are writable.
+- **SZ-2** The root, skill directory, artifact, sidecar, and WAL must not be
+  symbolic links.
+- **SZ-3** Writes are serialized per skill and use optimistic artifact hashes;
+  an external edit is reported rather than overwritten.
+- **SZ-4** A prepared WAL contains both old and new file pairs. Failure restores
+  the old pair; recovery installs the complete new pair only after the WAL is
+  marked installed.
+- **SZ-5** No source or rendered artifact may exceed 64 KiB.
+- **SZ-6** A successful commit has a matching `source.artifactSha256` in the
+  sidecar. Divergence blocks every subsequent mutation.
+
+### Modules
+
+```
+src/skillzip/
+  scanner.ts    deterministic Markdown blocks and token estimate
+  extractor.ts  constrained utility-model contract extraction
+  validate.ts   citation/type/tool/edge validation and locked fallback
+  optimizer.ts  exact sharing, scope lifting, workflow MDL candidates
+  render.ts     portable rendering, audit, source recovery
+  store.ts      managed-root policy, optimistic hash, WAL transaction
+  tool.ts       create/update/compress/audit/inspect/list orchestration
+  hooks.ts      AGENTS-independent trigger and capture lifecycle
+  types.ts      sidecar and operation contracts
+skillzip-smoke-test.ts
+```
