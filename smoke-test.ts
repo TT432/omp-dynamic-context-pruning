@@ -257,12 +257,13 @@ const compressTool = createCompressTool({
   assert(appended.length === before + 1 && appended[before].customType === PERSIST_TYPE, "compress appended a dcp-state entry");
   assert(textOf(res).includes('Compressed "a1" → "a2"'), "compress result confirms the range");
 
-  // out = [prompt, MARKER, msg1, msg2, msg3'(text only), SUMMARY, msg7, msg8, msg9, msg10]
+  // out = [prompt, MARKER, msg1, msg2, SUMMARY, msg7, msg8, msg9, msg10]
+  // (msg3 is dropped outright: stripping the start anchor leaves it call-less)
   const out = applyCompressions(state, logger, clone(convo()));
   const render = JSON.stringify(out);
-  assert(out.length === 10, `transform elides 3 + drops 2 stripped messages, injects marker + summary, keeps compress pair (got ${out.length})`);
+  assert(out.length === 9, `transform elides 3 + drops 2 stripped messages + the call-less start message, injects marker + summary, keeps compress pair (got ${out.length})`);
   assert(JSON.stringify(out[1]).includes("session_start"), "session_start marker sits right after the prompt");
-  assert(render.includes("Marking a1."), "start anchor message keeps its non-anchor text");
+  assert(!render.includes("Marking a1."), "start anchor message dropped entirely once call-less (stall-loop guard)");
   assert(!render.includes("tu_a1"), "start anchor toolCall stripped (anchor consumed)");
   assert(!render.includes("Working on feature X."), "span content elided");
   assert(!render.includes('Anchor \\"a1\\" recorded'), "start anchor toolResult elided");
@@ -271,8 +272,8 @@ const compressTool = createCompressTool({
   assert(render.includes("[Compressed: a1 → a2]") && render.includes("D1: built feature X"), "summary injected with header");
   assert(render.includes("tu_c1"), "compress call kept in context");
   assert(render.includes("Compressed a1 → a2"), "compress confirmation kept in context");
-  assert(JSON.stringify(out[5]).includes("[Compressed: a1 → a2]"), "summary takes the place of the elided span, before the end anchor");
-  assert(JSON.stringify(out[6]).includes("tu_a2") && JSON.stringify(out[7]).includes("tu_a2"), "end anchor call and result follow the summary");
+  assert(JSON.stringify(out[4]).includes("[Compressed: a1 → a2]"), "summary takes the place of the elided span, before the end anchor");
+  assert(JSON.stringify(out[5]).includes("tu_a2") && JSON.stringify(out[6]).includes("tu_a2"), "end anchor call and result follow the summary");
   assert(convo().length === 11 && !JSON.stringify(convo()).includes("[Compressed"), "transform never mutates the source conversation");
 }
 
@@ -299,16 +300,17 @@ const compressTool = createCompressTool({
   assert(state.blocks.length === 2 && state.blocks[0].id === 1 && state.blocks[1].id === 2, "chained compress keeps both blocks — summaries accumulate");
   assert(!textOf(res).includes("Absorbed"), "chaining absorbs nothing");
 
-  // out = [prompt, MARKER, msg1, msg2, msg3', SUMMARY1, msg7'(text only), SUMMARY2, msg13, msg14, msg15, msg16]
-  // (the tu_c1 compress pair at msg9/msg10 falls inside block2's span and is elided with it)
+  // out = [prompt, MARKER, msg1, msg2, SUMMARY1, SUMMARY2, msg13, msg14, msg15, msg16]
+  // (msg3 and msg7 are dropped outright: stripping leaves both call-less;
+  //  the tu_c1 compress pair at msg9/msg10 falls inside block2's span and is elided with it)
   const out = applyCompressions(state, logger, clone(extended));
   const render = JSON.stringify(out);
   assert(render.includes("D1: built feature X"), "earlier chained summary stays in place");
   assert(render.includes("D2: phase two"), "new summary injected");
   assert(render.indexOf("D1: built feature X") < render.indexOf("D2: phase two"), "summaries accumulate in order");
   assert(!render.includes("tu_a2"), "shared anchor stripped once used as a start");
-  assert(render.includes("Feature X done."), "shared anchor message keeps its text");
-  assert(render.includes("Marking a1."), "earlier consumed start text survives");
+  assert(!render.includes("Feature X done."), "shared anchor message dropped once call-less (stall-loop guard)");
+  assert(!render.includes("Marking a1."), "earlier consumed start message dropped once call-less");
   assert(render.includes("tu_a3"), "new end anchor survives");
   assert(!render.includes("Second phase."), "chained span content elided");
   assert(render.includes("tu_c2"), "chained compress call kept in context");
@@ -606,6 +608,37 @@ const compressTool = createCompressTool({
   const msgs = convo();
   const extracted = branchMessages(makeCtx(msgs));
   assert(extracted.length === msgs.length && extracted[0] === msgs[0], "branchMessages extracts message entries in order");
+}
+
+// ---------------------------------------------------------------------------
+// 13. stall-loop guard: a message left with no tool calls after stripping is
+//     dropped outright — even when it still has visible text. A surviving
+//     text-only shell reads as an assistant turn that announces tool calls
+//     and then stops ("开场三连：" → end of turn); the model imitates it and
+//     stalls after every compress (live session 019fef18, 2026-08-13).
+// ---------------------------------------------------------------------------
+{
+  const s13 = createSessionState();
+  const tool13 = createCompressTool({ state: s13, logger, zod: zodStub, persist: () => {} });
+  const conv: AgentMessage[] = [
+    { role: "user", content: [txt("p")] },
+    // work-unit opener: announcement text + anchor + todo + recon, one message
+    { role: "assistant", content: [txt("开工。建 todo、放锚点、侦察："), anchorCall("t_a", "a"), tu("t_b", "todo", { op: "init" }), tu("t_c", "glob", { path: "src/**" })] },
+    tres("t_a", "add_anchor", "ok"),
+    tres("t_b", "todo", "ok"),
+    tres("t_c", "glob", "src/a.ts"),
+    { role: "assistant", content: [txt("done"), anchorCall("t_d", "d")] },
+    tres("t_d", "add_anchor", "ok"),
+  ];
+  await tool13.execute("t_x", { startAnchor: "a", endAnchor: "d", summary: "S: done." }, undefined, undefined, makeCtx(conv.slice(0, 6)));
+
+  // out = [prompt, MARKER, SUMMARY, anchor(t_d) msg, tres(t_d)]
+  const out = applyCompressions(s13, logger, clone(conv));
+  const render = JSON.stringify(out);
+  assert(!render.includes("开工"), "text-only announcement shell dropped after stripping (stall-loop guard)");
+  assert(!render.includes("t_b") && !render.includes("t_c"), "orphan guard strips sibling calls whose results were elided");
+  assert(render.includes("t_d") && render.includes("done"), "end anchor message (still has its call) kept");
+  assert(render.includes("S: done."), "summary injected");
 }
 
 console.log(failures === 0 ? "\nALL OK" : `\n${failures} FAILURE(S)`);

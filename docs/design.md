@@ -67,8 +67,11 @@ The context transform then applies every active block:
 - whole-elide messages in `(startMsgIdx, endMsgIdx)` — for `session_start`
   starts, `[firstUser+1, endMsgIdx)`;
 - strip the start anchor's `add_anchor` toolCall block and its toolResult
-  message (**start anchor consumed**; non-anchor content of the same message is
-  kept, empty messages are dropped);
+  message (**start anchor consumed**); if stripping leaves the message with
+  no tool calls at all, the whole message is dropped — a surviving text-only
+  shell reads as an assistant turn that announces tool calls and then stops,
+  which the model imitates (observed live: 20+ text-only stall turns after
+  every compress, session 019fef18, 2026-08-13);
 - keep the end anchor untouched (**end anchor survives** for chaining);
 - keep the compress call itself and its toolResult in context — the success
   confirmation is the visible record that the compression happened;
@@ -79,10 +82,13 @@ The context transform then applies every active block:
 ### Provider-validity guards
 
 Two post-strip invariants keep the provider from rejecting the request
-(learned from a live HTTP 400: "assistant must not be empty"):
+(learned from a live HTTP 400: "assistant must not be empty") and the model
+from stalling:
 
-- **No empty shells** — a message reduced to thinking blocks by stripping is
-  dropped outright; providers reject content-less assistant messages.
+- **No call-less shells** — a message left without tool calls by stripping is
+  dropped outright, whether it is thinking-only (providers reject
+  content-less assistant messages) or text-only (an "I'm about to call
+  tools：" turn that just ends teaches the model to stall the same way).
 - **No orphan calls** — a kept toolCall whose toolResult message was elided is
   stripped as well (call/result pairing). Typical case: the start anchor's
   message also carried other tool calls whose results fall inside the span.

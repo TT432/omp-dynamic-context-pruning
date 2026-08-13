@@ -8,6 +8,9 @@
  *     starts, [firstUser+1, endMsgIdx);
  *   - the start anchor's add_anchor toolCall block and its toolResult message
  *     are stripped (start anchor consumed; session_start is virtual and kept);
+ *     a message left without tool calls by stripping is dropped outright —
+ *     a surviving text-only shell reads as "announce tool calls, end turn"
+ *     and teaches the model to stall after every compress;
  *   - the compress call itself and its toolResult are kept — the success
  *     confirmation staying in context tells future turns the compression
  *     happened;
@@ -26,7 +29,7 @@
 import type { AgentMessage, ContentBlock } from "./omp";
 import type { Logger } from "./logger";
 import type { CompressionBlock, SessionState } from "./state";
-import { findToolCallIndex, firstUserMessageIndex, isThinkingBlock, isToolCallBlock } from "./anchors";
+import { findToolCallIndex, firstUserMessageIndex, isToolCallBlock } from "./anchors";
 import { SESSION_START_MARKER, formatCompressedSummary } from "./prompts";
 
 interface ResolvedBlock {
@@ -129,9 +132,14 @@ export function applyCompressions(state: SessionState, logger: Logger, messages:
     if (stripIds.size > 0 && Array.isArray(msg.content)) {
       const filtered = msg.content.filter((block: ContentBlock) => !(isToolCallBlock(block) && stripIds.has(block.id)));
       if (filtered.length !== msg.content.length) {
-        // Stripping can leave a thinking-only shell; providers reject empty
-        // assistant messages, so drop those outright.
-        if (!filtered.some((block) => !isThinkingBlock(block))) continue;
+        // Stripping can leave a message with no tool calls at all. A
+        // thinking-only shell gets the request rejected (HTTP 400: assistant
+        // must not be empty); a text-only shell is worse — it survives as an
+        // assistant turn that announces tool calls ("现在调用 X：") and then
+        // ends, teaching the model to do exactly that (observed live: stalls
+        // of 20+ text-only turns after every compress). Both are dropped
+        // outright; the injected summary already carries the information.
+        if (!filtered.some(isToolCallBlock)) continue;
         kept = { ...msg, content: filtered };
       }
     }
