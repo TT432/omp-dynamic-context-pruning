@@ -1,8 +1,8 @@
 # omp-dcp — anchor-based conversation compression
 
 Dynamic Context Pruning for [Oh My Pi (omp)](https://omp.ai), distilled to one
-mechanism: **model-driven compression of conversation spans delimited by named
-anchors** — without ever modifying session history. All transforms happen on
+mechanism: **model-driven compression of conversation spans from a named
+anchor up to the compress call** — without ever modifying session history. All transforms happen on
 the copy of the conversation bound for the LLM; the persisted session stays
 byte-for-byte intact.
 
@@ -17,8 +17,10 @@ Two tools are exposed to the model:
   tool call itself is the anchor: its provider-assigned tool-call id is a
   stable, globally unique identity. Names are unique per session;
   `session_start` is reserved.
-- **`compress({ startAnchor, endAnchor, summary })`** — replaces the span
-  between two anchors with a technical summary **the model writes itself**.
+- **`compress({ startAnchor, summary })`** — replaces everything from the
+  start anchor up to the compress call itself with a technical summary **the
+  model writes itself**. The end of the span is implicit: the compress call's
+  own position.
 
 A virtual **`session_start`** anchor is always injected right after the
 original user prompt, so everything since the beginning of the session can be
@@ -27,28 +29,25 @@ compressed while the prompt itself stays intact.
 ### Compression semantics
 
 ```
-prompt · work1 · add_anchor(a1) · work2 · add_anchor(a2) · compress(a1, a2, desc)
+prompt · work1 · add_anchor(a1) · work2 · work3 · compress(a1, desc)
 ```
 
 becomes, in the LLM-facing context:
 
 ```
-prompt · [anchor: session_start] · work1 · [Compressed: a1 → a2] desc · add_anchor(a2)
+prompt · [anchor: session_start] · work1 · [Compressed: a1 → here] desc · compress(a1, desc)
 ```
 
-- Everything from the start anchor (inclusive) up to the end anchor
-  (exclusive) is replaced by the summary, which takes the span's place right
-  before the end anchor.
-- **The start anchor is consumed; the end anchor survives** — chain further
-  compressions from it: `compress(a2, a3, desc2)` leaves earlier summaries in
-  place, so they accumulate in order (`desc1, desc2, …`). A new span that
-  fully contains a prior compressed span absorbs it — carry its key points
+- Everything after the start anchor up to the compress call is replaced by
+  the summary, which takes the span's place right before the compress call.
+- **The start anchor is consumed; the compress call and its confirmation
+  stay in context** — later turns can see that the compression happened.
+- Earlier compressions whose compress call lies before the start anchor stay
+  in place: their summaries and yours **accumulate in order**. A span that
+  reaches back across a prior compression absorbs it — carry its key points
   into the new summary.
-- The `compress` call and its success confirmation stay in context, so later
-  turns can see that the compression happened.
-- Invalid requests — unknown anchor, empty or reversed range, an end anchor
-  already terminating or hidden inside an active compression, partial overlap —
-  fail with an error and change nothing.
+- Invalid requests — unknown anchor, empty range, a start anchor lying inside
+  an active compression — fail with an error and change nothing.
 - Session history is never modified; compression only reshapes what is sent to
   the model. Compression blocks persist across session resume (omp custom
   entries) and are dropped automatically if omp compacts the session.
@@ -61,13 +60,13 @@ and is never written back to storage or the display transcript). On a clone of
 the messages, DCP:
 
 1. injects the `[anchor: session_start]` marker after the first user message,
-2. elides the spans and strips the consumed-anchor / compress-call blocks of
-   every active compression block,
-3. injects each block's summary right after its end anchor.
+2. elides the span from each block's start anchor up to its compress call and
+   strips the consumed-anchor blocks,
+3. injects each block's summary right before its compress call.
 
-`compress` resolves anchor names on the persisted branch (positions are stable;
-even consumed anchors remain findable there), validates the range, absorbs
-fully-contained prior blocks, and records a compression block.
+`compress` resolves the anchor name on the persisted branch (positions are
+stable; even consumed anchors remain findable there), validates the range,
+absorbs fully-contained prior blocks, and records a compression block.
 
 Compared to quoting verbatim text anchors (the previous design), named anchors
 are unambiguous by construction — no substring matching, no ambiguity
@@ -95,7 +94,7 @@ and structured logs under `~/.omp/agent/logs/dcp/`.
 
 - `bunx tsc --noEmit` — type-checks clean.
 - `bun smoke-test.ts` — exercises the full pipeline (anchor scanning, both
-  tools, transform, chaining/consumption, session_start, validation errors,
+  tools, transform, accumulation/absorption, session_start, validation errors,
   persistence round trip, session lifecycle, orphan cleanup) against synthetic
   omp messages.
 

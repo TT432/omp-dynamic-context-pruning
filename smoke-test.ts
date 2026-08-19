@@ -6,6 +6,10 @@
  * toolCallId}` messages. Extension tools invoked via the xd:// envelope
  * (`write({path:"xd://add_anchor", content:"<json>"})`) are covered too.
  *
+ * compress semantics under test: compress(startAnchor, summary) elides the
+ * span from the anchor up to the compress call itself — the end is implicit,
+ * there is no endAnchor.
+ *
  * Run: bun smoke-test.ts
  */
 import { scanAnchors, firstUserMessageIndex } from "./src/anchors";
@@ -121,22 +125,18 @@ function makePi(appended: { customType: string; data: unknown }[]): ExtensionAPI
   };
 }
 
-function compressOn(tool: ToolDefinition, params: { startAnchor: string; endAnchor: string; summary: string }, ctx: ExtensionContext) {
-  return tool.execute(`tu_call_${params.endAnchor}`, params, undefined, undefined, ctx);
-}
-
 /**
  * Base conversation (indices matter — assertions reference them):
- *  0 user       "Build a demo app."                     ← original prompt
+ *  0 user       "Build a demo app."                       ← original prompt
  *  1 assistant  text + bash tu_w1
  *  2 toolResult tu_w1
- *  3 assistant  "Marking a1." + add_anchor(a1) tu_a1    ← start anchor (with text)
+ *  3 assistant  "Marking a1." + add_anchor(a1) tu_a1      ← start anchor (with text)
  *  4 toolResult tu_a1
  *  5 assistant  "Working on feature X." + write tu_w2
  *  6 toolResult tu_w2
- *  7 assistant  "Feature X done." + add_anchor(a2) tu_a2 ← end anchor (with text)
- *  8 toolResult tu_a2
- *  9 assistant  compress tu_c1
+ *  7 assistant  "Feature X done." + bash tu_w3
+ *  8 toolResult tu_w3
+ *  9 assistant  compress tu_c1 {startAnchor:"a1"}          ← implicit end of the span
  * 10 toolResult tu_c1
  */
 function convo(): AgentMessage[] {
@@ -148,10 +148,10 @@ function convo(): AgentMessage[] {
     tres("tu_a1", "add_anchor", 'Anchor "a1" recorded.'),
     { role: "assistant", content: [txt("Working on feature X."), tu("tu_w2", "write", { path: "x.ts" })] },
     tres("tu_w2", "write", "ok"),
-    { role: "assistant", content: [txt("Feature X done."), anchorCall("tu_a2", "a2")] },
-    tres("tu_a2", "add_anchor", 'Anchor "a2" recorded.'),
-    { role: "assistant", content: [tu("tu_c1", "compress", { startAnchor: "a1", endAnchor: "a2", summary: "D1" })] },
-    tres("tu_c1", "compress", "Compressed a1 → a2"),
+    { role: "assistant", content: [txt("Feature X done."), tu("tu_w3", "bash", { command: "test" })] },
+    tres("tu_w3", "bash", "pass"),
+    { role: "assistant", content: [tu("tu_c1", "compress", { startAnchor: "a1", summary: "D1" })] },
+    tres("tu_c1", "compress", "Compressed from a1"),
   ];
 }
 
@@ -175,7 +175,7 @@ const compressTool = createCompressTool({
 // ---------------------------------------------------------------------------
 {
   const anchors = scanAnchors(convo());
-  assert(anchors.map((a) => a.name).join(",") === "session_start,a1,a2", "scanAnchors finds session_start + named anchors in order");
+  assert(anchors.map((a) => a.name).join(",") === "session_start,a1", "scanAnchors finds session_start + named anchors in order");
   assert(anchors[0].toolCallId === null && anchors[0].msgIndex === 1, "session_start is virtual, inserted after the prompt");
   assert(anchors[1].toolCallId === "tu_a1" && anchors[1].msgIndex === 3, "a1 resolves to its tool-call id and message index");
   assert(firstUserMessageIndex(convo()) === 0, "first user message is the prompt");
@@ -190,7 +190,7 @@ const compressTool = createCompressTool({
     tres("w1", "write", "Anchor recorded"),
     { role: "assistant", content: [xdAnchorCall("w2", '{"name":"x2"}')] },
     tres("w2", "write", "Anchor recorded"),
-    { role: "assistant", content: [tu("w3", "write", { path: "xd://compress", content: '{"startAnchor":"x1","endAnchor":"x2","summary":"s"}' })] },
+    { role: "assistant", content: [tu("w3", "write", { path: "xd://compress", content: '{"startAnchor":"x1","summary":"s"}' })] },
     { role: "assistant", content: [tu("w4", "write", { path: "src/foo.ts", content: "code" })] },
   ];
   const envAnchors = scanAnchors(env);
@@ -236,13 +236,15 @@ const compressTool = createCompressTool({
 }
 
 // ---------------------------------------------------------------------------
-// 3. compress happy path + transform
+// 3. compress happy path + transform (implicit end = the compress call)
 // ---------------------------------------------------------------------------
 {
   const before = appended.length;
+  // in-flight timing: the compress call is not yet on the branch → end falls
+  // back to the end of history
   const res = await compressTool.execute(
     "tu_c1",
-    { startAnchor: "a1", endAnchor: "a2", summary: "D1: built feature X in x.ts." },
+    { startAnchor: "a1", summary: "D1: built feature X in x.ts." },
     undefined,
     undefined,
     makeCtx(convo().slice(0, 9)),
@@ -250,70 +252,77 @@ const compressTool = createCompressTool({
   assert(state.blocks.length === 1, "compress records one block");
   const b = state.blocks[0];
   assert(
-    b.startName === "a1" && b.startToolCallId === "tu_a1" && b.endName === "a2" && b.endToolCallId === "tu_a2" && b.compressCallId === "tu_c1",
-    "block stores anchor names, tool-call ids, and the compress call id",
+    b.startName === "a1" && b.startToolCallId === "tu_a1" && b.compressCallId === "tu_c1",
+    "block stores the start anchor, its tool-call id, and the compress call id (no end anchor)",
   );
+  assert(!("endName" in b) && !("endToolCallId" in b), "block carries no end-anchor fields");
   assert(state.dirty === false, "compress persists immediately (dirty cleared)");
   assert(appended.length === before + 1 && appended[before].customType === PERSIST_TYPE, "compress appended a dcp-state entry");
-  assert(textOf(res).includes('Compressed "a1" → "a2"'), "compress result confirms the range");
+  assert(textOf(res).includes('Compressed from "a1" to this compress call'), "compress result confirms the range");
+  assert(textOf(res).includes("5 message(s) elided"), "elided count spans from after the anchor to the compress call");
 
-  // out = [prompt, MARKER, msg1, msg2, SUMMARY, msg7, msg8, msg9, msg10]
+  // same result when the in-flight call IS already on the branch
+  const s3b = createSessionState();
+  const tool3b = createCompressTool({ state: s3b, logger, zod: zodStub, persist: () => {} });
+  const res3b = await tool3b.execute("tu_c1", { startAnchor: "a1", summary: "x" }, undefined, undefined, makeCtx(convo()));
+  assert(textOf(res3b).includes("5 message(s) elided"), "compress call already on the branch resolves to the same end");
+
+  // out = [prompt, MARKER, msg1, msg2, SUMMARY, msg9, msg10]
   // (msg3 is dropped outright: stripping the start anchor leaves it call-less)
   const out = applyCompressions(state, logger, clone(convo()));
   const render = JSON.stringify(out);
-  assert(out.length === 9, `transform elides 3 + drops 2 stripped messages + the call-less start message, injects marker + summary, keeps compress pair (got ${out.length})`);
+  assert(out.length === 7, `transform elides 5 + drops the call-less start message, injects marker + summary, keeps the compress pair (got ${out.length})`);
   assert(JSON.stringify(out[1]).includes("session_start"), "session_start marker sits right after the prompt");
   assert(!render.includes("Marking a1."), "start anchor message dropped entirely once call-less (stall-loop guard)");
   assert(!render.includes("tu_a1"), "start anchor toolCall stripped (anchor consumed)");
   assert(!render.includes("Working on feature X."), "span content elided");
+  assert(!render.includes("Feature X done."), "span tail elided — the span runs up to the compress call");
   assert(!render.includes('Anchor \\"a1\\" recorded'), "start anchor toolResult elided");
-  assert(render.includes("Feature X done."), "end anchor message survives with its text");
-  assert(render.includes("tu_a2"), "end anchor toolCall survives (kept for chaining)");
-  assert(render.includes("[Compressed: a1 → a2]") && render.includes("D1: built feature X"), "summary injected with header");
-  assert(render.includes("tu_c1"), "compress call kept in context");
-  assert(render.includes("Compressed a1 → a2"), "compress confirmation kept in context");
-  assert(JSON.stringify(out[4]).includes("[Compressed: a1 → a2]"), "summary takes the place of the elided span, before the end anchor");
-  assert(JSON.stringify(out[5]).includes("tu_a2") && JSON.stringify(out[6]).includes("tu_a2"), "end anchor call and result follow the summary");
+  assert(render.includes("[Compressed: a1 → here]") && render.includes("D1: built feature X"), "summary injected with header");
+  assert(render.includes("tu_c1"), "compress call kept in context (it is the implicit end)");
+  assert(JSON.stringify(out[4]).includes("[Compressed: a1 → here]"), "summary takes the place of the elided span");
+  assert(JSON.stringify(out[5]).includes("tu_c1") && JSON.stringify(out[6]).includes("tu_c1"), "compress call and its confirmation follow the summary");
   assert(convo().length === 11 && !JSON.stringify(convo()).includes("[Compressed"), "transform never mutates the source conversation");
 }
 
 // ---------------------------------------------------------------------------
-// 4. chaining: compress(a2 → a3) keeps both blocks; summaries accumulate
+// 4. accumulation: a later compress from an anchor placed after an earlier
+//    compress call keeps both blocks; summaries accumulate in order
 // ---------------------------------------------------------------------------
 {
   const extended: AgentMessage[] = [
     ...convo(),
-    { role: "assistant", content: [txt("Second phase."), tu("tu_w3", "bash", { command: "test" })] },
-    tres("tu_w3", "bash", "pass"),
-    { role: "assistant", content: [anchorCall("tu_a3", "a3")] },
-    tres("tu_a3", "add_anchor", 'Anchor "a3" recorded.'),
-    { role: "assistant", content: [tu("tu_c2", "compress", { startAnchor: "a2", endAnchor: "a3", summary: "D2" })] },
+    { role: "assistant", content: [txt("Second phase."), tu("tu_w4", "bash", { command: "test" })] },
+    tres("tu_w4", "bash", "pass"),
+    { role: "assistant", content: [anchorCall("tu_a2", "a2")] },
+    tres("tu_a2", "add_anchor", 'Anchor "a2" recorded.'),
+    { role: "assistant", content: [tu("tu_c2", "compress", { startAnchor: "a2", summary: "D2" })] },
     tres("tu_c2", "compress", "ok"),
   ];
   const res = await compressTool.execute(
     "tu_c2",
-    { startAnchor: "a2", endAnchor: "a3", summary: "D2: phase two, tests pass." },
+    { startAnchor: "a2", summary: "D2: phase two, tests pass." },
     undefined,
     undefined,
-    makeCtx(extended.slice(0, 14)),
+    makeCtx(extended.slice(0, 15)),
   );
-  assert(state.blocks.length === 2 && state.blocks[0].id === 1 && state.blocks[1].id === 2, "chained compress keeps both blocks — summaries accumulate");
-  assert(!textOf(res).includes("Absorbed"), "chaining absorbs nothing");
+  assert(state.blocks.length === 2 && state.blocks[0].id === 1 && state.blocks[1].id === 2, "second compress keeps the earlier block — summaries accumulate");
+  assert(!textOf(res).includes("Absorbed"), "accumulation absorbs nothing");
 
-  // out = [prompt, MARKER, msg1, msg2, SUMMARY1, SUMMARY2, msg13, msg14, msg15, msg16]
-  // (msg3 and msg7 are dropped outright: stripping leaves both call-less;
-  //  the tu_c1 compress pair at msg9/msg10 falls inside block2's span and is elided with it)
+  // out = [prompt, MARKER, msg1, msg2, SUMMARY1, msg9, msg10, msg11, msg12, SUMMARY2, msg15, msg16]
+  // (msg3 and msg13 are dropped outright: stripping leaves both call-less;
+  //  msg14 falls inside block2's span and is elided with it)
   const out = applyCompressions(state, logger, clone(extended));
   const render = JSON.stringify(out);
-  assert(render.includes("D1: built feature X"), "earlier chained summary stays in place");
+  assert(out.length === 12, `both summaries + both compress pairs survive (got ${out.length})`);
+  assert(render.includes("D1: built feature X"), "earlier summary stays in place");
   assert(render.includes("D2: phase two"), "new summary injected");
   assert(render.indexOf("D1: built feature X") < render.indexOf("D2: phase two"), "summaries accumulate in order");
-  assert(!render.includes("tu_a2"), "shared anchor stripped once used as a start");
-  assert(!render.includes("Feature X done."), "shared anchor message dropped once call-less (stall-loop guard)");
-  assert(!render.includes("Marking a1."), "earlier consumed start message dropped once call-less");
-  assert(render.includes("tu_a3"), "new end anchor survives");
-  assert(!render.includes("Second phase."), "chained span content elided");
-  assert(render.includes("tu_c2"), "chained compress call kept in context");
+  assert(render.includes("tu_c1"), "earlier compress call kept — it sits before the new span");
+  assert(render.includes("Second phase."), "work between the two compressions kept");
+  assert(!render.includes("tu_a2"), "new start anchor stripped (consumed)");
+  assert(!render.includes('Anchor \\"a2\\" recorded'), "new start anchor toolResult elided with the span");
+  assert(render.includes("tu_c2"), "new compress call kept in context");
 }
 
 // ---------------------------------------------------------------------------
@@ -328,22 +337,22 @@ const compressTool = createCompressTool({
     tres("tu_x1", "bash", "files"),
     { role: "assistant", content: [anchorCall("tu_b1", "b1")] },
     tres("tu_b1", "add_anchor", "ok"),
-    { role: "assistant", content: [tu("tu_c3", "compress", { startAnchor: "session_start", endAnchor: "b1", summary: "DS" })] },
+    { role: "assistant", content: [tu("tu_c3", "compress", { startAnchor: "session_start", summary: "DS" })] },
     tres("tu_c3", "compress", "ok"),
   ];
-  await tool2.execute("tu_c3", { startAnchor: "session_start", endAnchor: "b1", summary: "DS: early exploration done." }, undefined, undefined, makeCtx(mini.slice(0, 5)));
+  await tool2.execute("tu_c3", { startAnchor: "session_start", summary: "DS: early exploration done." }, undefined, undefined, makeCtx(mini.slice(0, 5)));
   assert(s2.blocks.length === 1 && s2.blocks[0].startToolCallId === null, "session_start block stores a null startToolCallId");
 
-  // out = [prompt, MARKER, SUMMARY, anchor(b1), tr_b1, compress(tu_c3), tr_c3]
+  // out = [prompt, MARKER, SUMMARY, compress(tu_c3), tr_c3]
   const out = applyCompressions(s2, logger, clone(mini));
   const render = JSON.stringify(out);
-  assert(out.length === 7, `session_start compression keeps prompt + marker + summary + end anchor pair + compress pair (got ${out.length})`);
+  assert(out.length === 5, `session_start compression keeps prompt + marker + summary + compress pair (got ${out.length})`);
   assert(render.includes("Original prompt."), "original prompt preserved");
   assert(render.includes("[anchor: session_start"), "session_start marker preserved (never consumed)");
   assert(!render.includes("tu_x1"), "post-prompt span elided");
-  assert(JSON.stringify(out[2]).includes("[Compressed: session_start → b1]"), "summary before the end anchor, header cites session_start");
-  assert(JSON.stringify(out[3]).includes("tu_b1"), "end anchor follows the summary");
-  assert(render.includes("tu_c3"), "compress call kept in context");
+  assert(!render.includes("tu_b1"), "anchor inside the span elided with it");
+  assert(JSON.stringify(out[2]).includes("[Compressed: session_start → here]"), "summary before the compress call, header cites session_start");
+  assert(JSON.stringify(out[3]).includes("tu_c3"), "compress call follows the summary");
 }
 
 // ---------------------------------------------------------------------------
@@ -354,27 +363,31 @@ const compressTool = createCompressTool({
   const tool3 = createCompressTool({ state: s3, logger, zod: zodStub, persist: () => {} });
   const ctx = makeCtx(convo().slice(0, 9));
 
-  await assertThrows(() => compressOn(tool3, { startAnchor: "nope", endAnchor: "a2", summary: "x" }, ctx), /unknown startAnchor "nope".*session_start/s, "unknown startAnchor rejected, available anchors listed");
-  await assertThrows(() => compressOn(tool3, { startAnchor: "a1", endAnchor: "nope", summary: "x" }, ctx), /unknown endAnchor/, "unknown endAnchor rejected");
-  await assertThrows(() => compressOn(tool3, { startAnchor: "a1", endAnchor: "a1", summary: "x" }, ctx), /must differ/, "same anchor rejected");
-  await assertThrows(() => compressOn(tool3, { startAnchor: "a2", endAnchor: "a1", summary: "x" }, ctx), /must come before/, "reversed range rejected");
-  await assertThrows(() => compressOn(tool3, { startAnchor: "a1", endAnchor: "session_start", summary: "x" }, ctx), /cannot be endAnchor/, "session_start as end rejected");
-  await assertThrows(() => compressOn(tool3, { startAnchor: "a1", endAnchor: "a2", summary: "  " }, ctx), /non-empty string "summary"/, "empty summary rejected");
+  await assertThrows(
+    () => tool3.execute("tu_e1", { startAnchor: "nope", summary: "x" }, undefined, undefined, ctx),
+    /unknown startAnchor "nope".*session_start/s,
+    "unknown startAnchor rejected, available anchors listed",
+  );
+  await assertThrows(
+    () => tool3.execute("tu_e2", { startAnchor: "a1", summary: "  " }, undefined, undefined, ctx),
+    /non-empty string "summary"/,
+    "empty summary rejected",
+  );
 
-  // empty range: two anchor calls in directly adjacent assistant messages
+  // empty range: the anchor call is the last thing before the compress call
   const adjacent: AgentMessage[] = [
     { role: "user", content: [txt("p")] },
     { role: "assistant", content: [anchorCall("tu_p1", "p1")] },
-    { role: "assistant", content: [anchorCall("tu_p2", "p2")] },
   ];
   await assertThrows(
-    () => compressOn(tool3, { startAnchor: "p1", endAnchor: "p2", summary: "x" }, makeCtx(adjacent)),
+    () => tool3.execute("tu_e3", { startAnchor: "p1", summary: "x" }, undefined, undefined, makeCtx(adjacent)),
     /contains no messages/,
-    "empty range rejected",
+    "empty range rejected (anchor immediately precedes the compress call)",
   );
   assert(s3.blocks.length === 0, "failed compresses record no blocks");
 
-  // same-end rejection + end-inside rejection + full subsumption + true partial
+  // start anchor inside an active compression → reject; reaching back across
+  // a prior compression from an earlier anchor → absorb
   const s4 = createSessionState();
   const pi4 = makePi([]);
   const tool4 = createCompressTool({ state: s4, logger, zod: zodStub, persist: () => saveSessionState(pi4, s4) });
@@ -382,44 +395,54 @@ const compressTool = createCompressTool({
     { role: "user", content: [txt("p")] },
     { role: "assistant", content: [anchorCall("tu_q1", "q1")] },
     tres("tu_q1", "add_anchor", "1"),
-    { role: "assistant", content: [txt("mid1"), anchorCall("tu_q2", "q2")] },
+    { role: "assistant", content: [txt("mid1"), tu("tu_m1", "bash", { command: "ls" })] },
+    tres("tu_m1", "bash", "files"),
+    { role: "assistant", content: [anchorCall("tu_q2", "q2")] },
     tres("tu_q2", "add_anchor", "2"),
-    { role: "assistant", content: [txt("mid2"), anchorCall("tu_q3", "q3")] },
-    tres("tu_q3", "add_anchor", "3"),
-    { role: "assistant", content: [anchorCall("tu_q4", "q4")] },
-    tres("tu_q4", "add_anchor", "4"),
+    { role: "assistant", content: [tu("tu_c1", "compress", { startAnchor: "q1", summary: "first" })] },
+    tres("tu_c1", "compress", "ok"),
+    { role: "assistant", content: [txt("later work"), tu("tu_m2", "bash", { command: "test" })] },
+    tres("tu_m2", "bash", "pass"),
+    { role: "assistant", content: [tu("tu_c2", "compress", { startAnchor: "q2", summary: "x" })] },
+    tres("tu_c2", "compress", "ok"),
   ];
-  await compressOn(tool4, { startAnchor: "q2", endAnchor: "q3", summary: "middle" }, makeCtx(wide));
+  await tool4.execute("tu_c1", { startAnchor: "q1", summary: "first half" }, undefined, undefined, makeCtx(wide.slice(0, 7)));
   assert(s4.blocks.length === 1, "setup block recorded");
   await assertThrows(
-    () => compressOn(tool4, { startAnchor: "q1", endAnchor: "q3", summary: "x" }, makeCtx(wide)),
-    /already ends an active compression.*chain/s,
-    "reusing an active end anchor rejected with chaining hint",
+    () => tool4.execute("tu_c2", { startAnchor: "q2", summary: "x" }, undefined, undefined, makeCtx(wide.slice(0, 11))),
+    /lies inside the active compression.*q1/s,
+    "start anchor inside an active compression rejected (its span would be half-elided)",
   );
-  await assertThrows(
-    () => compressOn(tool4, { startAnchor: "q1", endAnchor: "q2", summary: "x" }, makeCtx(wide)),
-    /inside the active compression/,
-    "end anchor inside an active compression rejected (its survival is unguaranteed)",
-  );
-  assert(s4.blocks.length === 1, "rejections leave existing blocks untouched");
-  // full subsumption: q1 → q4 fully contains (q2 → q3)
-  await compressOn(tool4, { startAnchor: "q1", endAnchor: "q4", summary: "everything" }, makeCtx(wide));
-  assert(s4.blocks.length === 1 && s4.blocks[0].summary === "everything", "fully-contained block absorbed by the wider range");
+  assert(s4.blocks.length === 1 && s4.blocks[0].summary === "first half", "rejection leaves existing blocks untouched");
 
-  // true partial overlap: block (q1 → q3) vs new (q2 → q4) — interleaved spans
-  const s4b = createSessionState();
-  const tool4b = createCompressTool({ state: s4b, logger, zod: zodStub, persist: () => {} });
-  await compressOn(tool4b, { startAnchor: "q1", endAnchor: "q3", summary: "first half" }, makeCtx(wide));
-  await assertThrows(
-    () => compressOn(tool4b, { startAnchor: "q2", endAnchor: "q4", summary: "x" }, makeCtx(wide)),
-    /partially overlaps/,
-    "interleaved range rejected as partial overlap",
+  // absorption: compress from an earlier anchor reaching across the prior block
+  const res = await tool4.execute(
+    "tu_c3",
+    { startAnchor: "session_start", summary: "everything so far" },
+    undefined,
+    undefined,
+    makeCtx(wide.slice(0, 11)),
   );
-  assert(s4b.blocks.length === 1, "partial-overlap rejection leaves blocks untouched");
+  assert(s4.blocks.length === 1 && s4.blocks[0].summary === "everything so far", "prior block fully contained → absorbed into the new summary");
+  assert(textOf(res).includes("Absorbed 1 prior compression"), "absorption reported in the result");
+
+  // transform of the absorbing block: the old compress pair is elided too
+  const withC3: AgentMessage[] = [
+    ...wide,
+    { role: "assistant", content: [tu("tu_c3", "compress", { startAnchor: "session_start", summary: "everything so far" })] },
+    tres("tu_c3", "compress", "ok"),
+  ];
+  const out = applyCompressions(s4, logger, clone(withC3));
+  const render = JSON.stringify(out);
+  assert(render.includes("everything so far"), "absorbing summary injected");
+  assert(!render.includes("first half"), "absorbed summary never injected");
+  assert(!render.includes("tu_c1"), "absorbed block's compress call elided with the span");
+  assert(!render.includes("mid1") && !render.includes("later work"), "whole span elided");
+  assert(render.includes("tu_c3"), "absorbing compress call kept");
 }
 
 // ---------------------------------------------------------------------------
-// 7. persistence round trip (v3) + older versions ignored
+// 7. persistence round trip (v4) + older versions ignored
 // ---------------------------------------------------------------------------
 {
   const s5 = createSessionState();
@@ -428,8 +451,6 @@ const compressTool = createCompressTool({
     id: 7,
     startName: "a1",
     startToolCallId: "tu_a1",
-    endName: "a2",
-    endToolCallId: "tu_a2",
     summary: "S",
     compressCallId: "tu_c",
     createdAt: 123,
@@ -448,7 +469,7 @@ const compressTool = createCompressTool({
   assert(loaded && s6.blocks.length === 1 && s6.blocks[0].id === 7 && s6.blocks[0].compressCallId === "tu_c", "round trip restores the block");
   assert(s6.nextBlockId === 8, "nextBlockId restored");
 
-  for (const v of [1, 2]) {
+  for (const v of [1, 2, 3]) {
     const oldBranch: SessionEntry[] = [
       { type: "custom", id: "c2", parentId: null, timestamp: new Date().toISOString(), customType: PERSIST_TYPE, data: { v, maps: {} } },
     ];
@@ -469,7 +490,7 @@ const compressTool = createCompressTool({
   const seeded = createSessionState();
   seeded.sessionId = "sess-life";
   seeded.blocks.push({
-    id: 3, startName: "a", startToolCallId: "tu_a", endName: "b", endToolCallId: "tu_b",
+    id: 3, startName: "a", startToolCallId: "tu_a",
     summary: "seed", compressCallId: "tu_c", createdAt: 1,
   });
   seeded.nextBlockId = 4;
@@ -511,7 +532,7 @@ const compressTool = createCompressTool({
   const deps9: HandlerDeps = { state: s9, logger, pi: makePi([]) };
   // bind first — compress always happens on an already-bound session
   bindSession(deps9, makeCtx(msgs), "test");
-  await compressOn(tool9, { startAnchor: "a1", endAnchor: "a2", summary: "D1 again." }, makeCtx(msgs.slice(0, 9)));
+  await tool9.execute("tu_c1", { startAnchor: "a1", summary: "D1 again." }, undefined, undefined, makeCtx(msgs.slice(0, 9)));
 
   const handler = createContextHandler(deps9);
   const result = handler({ messages: clone(msgs) }, makeCtx(msgs));
@@ -519,10 +540,10 @@ const compressTool = createCompressTool({
   assert(render.includes("[anchor: session_start") && render.includes("D1 again.") && !render.includes("Working on feature X."), "context handler returns the transformed conversation");
   assert(s9.sessionId !== null, "context handler lazy-binds the session");
 
-  // orphan: block whose end anchor no longer exists gets dropped + dirty
+  // orphan: block whose compress call no longer exists gets dropped + dirty
   s9.blocks.push({
-    id: 99, startName: "ghost1", startToolCallId: "tu_g1", endName: "ghost2", endToolCallId: "tu_gone",
-    summary: "ghost", compressCallId: "tu_gc", createdAt: 0,
+    id: 99, startName: "ghost", startToolCallId: "tu_g1",
+    summary: "ghost", compressCallId: "tu_gone", createdAt: 0,
   });
   s9.dirty = false;
   const out2 = applyCompressions(s9, logger, clone(msgs));
@@ -543,26 +564,25 @@ const compressTool = createCompressTool({
     tres("tu_r1", "read", "file a"),
     { role: "assistant", content: [xdAnchorCall("w1", '{"name": "reorg_done"}')] },
     tres("w1", "write", 'Anchor "reorg_done" recorded.'),
-    { role: "assistant", content: [tu("tu_c9", "write", { path: "xd://compress", content: '{"startAnchor":"session_start","endAnchor":"reorg_done","summary":"S"}' })] },
+    { role: "assistant", content: [tu("tu_c9", "write", { path: "xd://compress", content: '{"startAnchor":"session_start","summary":"S"}' })] },
     tres("tu_c9", "write", "Compressed"),
   ];
   // the exact reported flow: compress right after the anchor was added
   const res = await tool10.execute(
     "tu_c9",
-    { startAnchor: "session_start", endAnchor: "reorg_done", summary: "S:摸底完成。" },
+    { startAnchor: "session_start", summary: "S:摸底完成。" },
     undefined,
     undefined,
     makeCtx(live.slice(0, 5)),
   );
-  assert(s10.blocks.length === 1 && s10.blocks[0].endToolCallId === "w1", "xd-enveloped end anchor resolves immediately after add_anchor");
-  assert(textOf(res).includes('Compressed "session_start" → "reorg_done"'), "compress confirms the enveloped range");
+  assert(s10.blocks.length === 1 && s10.blocks[0].compressCallId === "tu_c9", "xd-enveloped compress resolves its own call as the span end");
+  assert(textOf(res).includes('Compressed from "session_start"'), "compress confirms the enveloped range");
 
   const out = applyCompressions(s10, logger, clone(live));
   const render = JSON.stringify(out);
   assert(render.includes("S:摸底完成。"), "summary injected for enveloped block");
   assert(!render.includes("file a"), "span elided through the envelope");
-  assert(render.includes("w1"), "enveloped end anchor survives");
-  assert(render.includes("tu_c9"), "enveloped compress call kept");
+  assert(render.includes("tu_c9"), "enveloped compress call kept as the span end");
 }
 
 // ---------------------------------------------------------------------------
@@ -578,24 +598,24 @@ const compressTool = createCompressTool({
     { role: "assistant", content: [{ type: "thinking", thinking: "hmm" }, anchorCall("t_a", "a"), tu("t_b", "bash", { command: "ls" })] },
     tres("t_a", "add_anchor", "ok"),
     tres("t_b", "bash", "files"),
-    { role: "assistant", content: [anchorCall("t_c", "c")] },
-    tres("t_c", "add_anchor", "ok"),
+    { role: "assistant", content: [txt("done"), tu("t_d", "bash", { command: "test" })] },
+    tres("t_d", "bash", "pass"),
     // compress call accompanies a thinking block — the pair stays in context
-    { role: "assistant", content: [{ type: "thinking", thinking: "plan" }, tu("t_x", "compress", { startAnchor: "a", endAnchor: "c", summary: "S" })] },
+    { role: "assistant", content: [{ type: "thinking", thinking: "plan" }, tu("t_x", "compress", { startAnchor: "a", summary: "S" })] },
     tres("t_x", "compress", "ok"),
   ];
-  await tool11.execute("t_x", { startAnchor: "a", endAnchor: "c", summary: "S: done." }, undefined, undefined, makeCtx(conv.slice(0, 6)));
+  await tool11.execute("t_x", { startAnchor: "a", summary: "S: done." }, undefined, undefined, makeCtx(conv.slice(0, 6)));
 
-  // out = [prompt, MARKER, SUMMARY, anchor(t_c), tres(t_c), compress(t_x)+thinking, tres(t_x)]
+  // out = [prompt, MARKER, SUMMARY, compress(t_x)+thinking, tres(t_x)]
   const out = applyCompressions(s11, logger, clone(conv));
   const render = JSON.stringify(out);
-  assert(out.length === 7, `shell drop + orphan guard + kept compress pair (got ${out.length})`);
+  assert(out.length === 5, `shell drop + orphan guard + kept compress pair (got ${out.length})`);
   assert(!render.includes("t_b"), "orphan guard strips the call whose toolResult was elided");
   assert(!render.includes("t_a"), "start anchor stripped");
   assert(!render.includes("hmm"), "thinking-only assistant shell dropped after stripping");
+  assert(!render.includes("t_d"), "span tail elided up to the compress call");
   assert(render.includes("t_x") && render.includes("plan"), "compress call and its thinking block kept");
   assert(render.includes("S: done."), "summary injected");
-  assert(render.includes("t_c"), "end anchor call kept");
   // every surviving toolCall has its toolResult in the output
   const ids = [...render.matchAll(/"id":"(t_[a-z])"/g)].map((m) => m[1]);
   assert(ids.every((id) => render.includes(`"toolCallId\":\"${id}\"`) || render.includes(`"toolCallId":"${id}"`)), "no dangling toolCall without a toolResult");
@@ -627,17 +647,20 @@ const compressTool = createCompressTool({
     tres("t_a", "add_anchor", "ok"),
     tres("t_b", "todo", "ok"),
     tres("t_c", "glob", "src/a.ts"),
-    { role: "assistant", content: [txt("done"), anchorCall("t_d", "d")] },
-    tres("t_d", "add_anchor", "ok"),
+    { role: "assistant", content: [txt("done"), tu("t_d", "bash", { command: "test" })] },
+    tres("t_d", "bash", "pass"),
+    { role: "assistant", content: [tu("t_x", "compress", { startAnchor: "a", summary: "S" })] },
+    tres("t_x", "compress", "ok"),
   ];
-  await tool13.execute("t_x", { startAnchor: "a", endAnchor: "d", summary: "S: done." }, undefined, undefined, makeCtx(conv.slice(0, 6)));
+  await tool13.execute("t_x", { startAnchor: "a", summary: "S: done." }, undefined, undefined, makeCtx(conv.slice(0, 7)));
 
-  // out = [prompt, MARKER, SUMMARY, anchor(t_d) msg, tres(t_d)]
+  // out = [prompt, MARKER, SUMMARY, compress(t_x), tres(t_x)]
   const out = applyCompressions(s13, logger, clone(conv));
   const render = JSON.stringify(out);
   assert(!render.includes("开工"), "text-only announcement shell dropped after stripping (stall-loop guard)");
   assert(!render.includes("t_b") && !render.includes("t_c"), "orphan guard strips sibling calls whose results were elided");
-  assert(render.includes("t_d") && render.includes("done"), "end anchor message (still has its call) kept");
+  assert(!render.includes("t_d"), "span tail elided up to the compress call");
+  assert(render.includes("t_x"), "compress call kept as the span end");
   assert(render.includes("S: done."), "summary injected");
 }
 

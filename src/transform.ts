@@ -4,23 +4,24 @@
  * receives a deep clone from hooks.ts).
  *
  * Per block:
- *   - whole messages in (startMsgIdx, endMsgIdx) are elided — for session_start
- *     starts, [firstUser+1, endMsgIdx);
+ *   - whole messages in (startMsgIdx, compressMsgIdx) are elided — for
+ *     session_start starts, [firstUser+1, compressMsgIdx);
  *   - the start anchor's add_anchor toolCall block and its toolResult message
  *     are stripped (start anchor consumed; session_start is virtual and kept);
  *     a message left without tool calls by stripping is dropped outright —
  *     a surviving text-only shell reads as "announce tool calls, end turn"
  *     and teaches the model to stall after every compress;
- *   - the compress call itself and its toolResult are kept — the success
- *     confirmation staying in context tells future turns the compression
- *     happened;
- *   - the summary is injected right before the end anchor's message — it
- *     takes the place of the elided span, and the end anchor follows it.
- *     Chained blocks (new start = old end) therefore accumulate summaries
- *     in order instead of absorbing them.
+ *   - the compress call itself and its toolResult are kept — it is the
+ *     implicit end of the span, and the success confirmation staying in
+ *     context tells future turns the compression happened;
+ *   - the summary is injected right before the compress call's message — it
+ *     takes the place of the elided span, and the compress call follows it.
+ *     Blocks whose spans don't reach a prior compress call therefore
+ *     accumulate summaries in order instead of absorbing them.
  *
- * Blocks whose anchors no longer resolve (fork/compaction residue) are dropped
- * and the state marked dirty so a later flush persists the cleanup.
+ * Blocks whose anchors or compress call no longer resolve (fork/compaction
+ * residue) are dropped and the state marked dirty so a later flush persists
+ * the cleanup.
  *
  * Message shape: pi-mono — assistant messages carry toolCall blocks; tool
  * results are standalone toolResult messages keyed by toolCallId.
@@ -36,7 +37,7 @@ interface ResolvedBlock {
   block: CompressionBlock;
   /** First whole-elided message index. */
   lo: number;
-  /** End anchor message index (exclusive elision bound; summary goes before it). */
+  /** Compress call message index (exclusive elision bound; summary goes before it). */
   hi: number;
 }
 
@@ -47,7 +48,7 @@ function resolveBlocks(state: SessionState, logger: Logger, messages: AgentMessa
   let dropped = false;
 
   for (const block of state.blocks) {
-    const hi = findToolCallIndex(messages, block.endToolCallId);
+    const hi = findToolCallIndex(messages, block.compressCallId);
     let lo = -1;
     if (block.startToolCallId === null) {
       if (firstUser >= 0) lo = firstUser + 1;
@@ -56,7 +57,7 @@ function resolveBlocks(state: SessionState, logger: Logger, messages: AgentMessa
       if (startIdx >= 0) lo = startIdx + 1;
     }
     if (hi < 0 || lo < 0 || lo >= hi) {
-      logger.warn("Dropping unresolvable compression block", { blockId: block.id, range: [block.startName, block.endName], hi, lo });
+      logger.warn("Dropping unresolvable compression block", { blockId: block.id, from: block.startName, hi, lo });
       dropped = true;
       continue;
     }
@@ -92,7 +93,7 @@ export function applyCompressions(state: SessionState, logger: Logger, messages:
     if (!list) return;
     for (const b of list) {
       logger.debug("Injected compress summary", { blockId: b.id });
-      out.push(syntheticText(formatCompressedSummary(b.startName, b.endName, b.summary)));
+      out.push(syntheticText(formatCompressedSummary(b.startName, b.summary)));
     }
   };
 
@@ -122,7 +123,7 @@ export function applyCompressions(state: SessionState, logger: Logger, messages:
 
   for (let i = 0; i < messages.length; i++) {
     if (elideWhole.has(i)) continue;
-    pushInjections(i); // summaries take the place of the elided span, before the end anchor
+    pushInjections(i); // summaries take the place of the elided span, before the compress call
     const msg = messages[i];
     // toolResult messages of stripped calls (start anchor / compress) go away wholesale
     if (msg.role === "toolResult" && typeof msg.toolCallId === "string" && stripIds.has(msg.toolCallId)) {

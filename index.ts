@@ -4,8 +4,8 @@
  * Default-exported factory; omp loads this module and calls it with the live
  * `ExtensionAPI`. Two tools are registered:
  *   - add_anchor: place a named anchor at the call site;
- *   - compress:   replace the span between two anchors with a model-authored
- *                 summary (start anchor consumed, end anchor kept for chaining).
+ *   - compress:   replace the span from an anchor up to the compress call
+ *                 itself with a model-authored summary (start anchor consumed).
  * The context handler applies compression blocks to the outgoing message copy
  * on every LLM request. Session storage is never modified.
  */

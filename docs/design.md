@@ -1,7 +1,8 @@
 # DCP for omp — Design (anchor mode)
 
 Dynamic Context Pruning for Oh My Pi, distilled to a single mechanism:
-**model-driven compression of conversation spans delimited by named anchors**.
+**model-driven compression of the conversation span from a named anchor up to
+the compress call itself**.
 Originally modeled on
 [Opencode-DCP/opencode-dynamic-context-pruning](https://github.com/Opencode-DCP/opencode-dynamic-context-pruning);
 the automatic strategies, nudges, commands, and config system were removed in
@@ -51,33 +52,38 @@ which is exactly how the first anchor-mode build failed in production.)
 
 ## compress semantics
 
-`compress({ startAnchor, endAnchor, summary })` resolves both anchors on the
-persisted branch (`ctx.sessionManager.getBranch()`), validates, and records a
-compression block:
+`compress({ startAnchor, summary })` resolves the anchor on the persisted
+branch (`ctx.sessionManager.getBranch()`), validates, and records a
+compression block. **The end of the span is implicit: the compress call
+itself.** There is no `endAnchor` — a span always runs from the start anchor
+to the point where the model calls compress. When execute runs, the in-flight
+compress call is usually not yet appended to the branch; it lands at the end,
+so the end position falls back to `messages.length` (validation and elision
+counting only — the durable identity is the compress call's tool-call id).
 
 ```ts
 {
   id, startName, startToolCallId /* null = session_start */,
-  endName, endToolCallId, summary, compressCallId, createdAt
+  summary, compressCallId /* implicit span end */, createdAt
 }
 ```
 
 The context transform then applies every active block:
 
-- whole-elide messages in `(startMsgIdx, endMsgIdx)` — for `session_start`
-  starts, `[firstUser+1, endMsgIdx)`;
+- whole-elide messages in `(startMsgIdx, compressMsgIdx)` — for
+  `session_start` starts, `[firstUser+1, compressMsgIdx)`;
 - strip the start anchor's `add_anchor` toolCall block and its toolResult
   message (**start anchor consumed**); if stripping leaves the message with
   no tool calls at all, the whole message is dropped — a surviving text-only
   shell reads as an assistant turn that announces tool calls and then stops,
   which the model imitates (observed live: 20+ text-only stall turns after
   every compress, session 019fef18, 2026-08-13);
-- keep the end anchor untouched (**end anchor survives** for chaining);
-- keep the compress call itself and its toolResult in context — the success
-  confirmation is the visible record that the compression happened;
-- inject `[Compressed: start → end]\n<summary>` as a synthetic user message
-  right **before** the end anchor's message — the summary takes the elided
-  span's place and the end anchor follows it.
+- keep the compress call itself and its toolResult in context — the call is
+  the span's end, and the success confirmation is the visible record that the
+  compression happened;
+- inject `[Compressed: start → here]\n<summary>` as a synthetic user message
+  right **before** the compress call's message — the summary takes the elided
+  span's place and the compress call follows it.
 
 ### Provider-validity guards
 
@@ -93,24 +99,23 @@ from stalling:
   stripped as well (call/result pairing). Typical case: the start anchor's
   message also carried other tool calls whose results fall inside the span.
 
-### Chaining, absorption, and overlap rules
+### Accumulation, absorption, and overlap rules
 
-Given an existing block B `(bStartIdx, bEndIdx)` and a new range
-`[start, end)`:
+The new span always ends at the new compress call `N` (eliding
+`[N_lo, N_idx)`). An existing block B elides `[B_lo, B_hi)` where `B_hi` is
+the message index of B's own compress call — always before `N`:
 
 | Situation | Rule |
 | --- | --- |
-| `bEnd == end` | reject — the anchor already ends an active compression; chain from it instead |
-| `end ∈ [bStart, bEnd)` | reject — the end anchor lies inside an active compression and cannot be guaranteed to survive |
-| `bEnd == start` | keep B — **chaining**: B's summary sits before the new start anchor's message, outside the new span; summaries accumulate in order |
-| `bEnd ∈ (start, end)` and `bStart ≥ start` | consume B — fully contained, absorbed into the new summary |
-| `bEnd ∈ (start, end)` and `bStart < start` | reject — partial overlap |
-| otherwise | keep B |
+| `B_hi < N_lo` | keep B — B ends before the new span starts; its summary and compress pair stay in place, summaries **accumulate** in order |
+| `B_hi ≥ N_lo` and `B_lo ≥ N_lo` | consume B — fully contained (B's compress call, summary injection point, and span all fall inside the new span), absorbed into the new summary |
+| `B_hi ≥ N_lo` and `B_lo < N_lo` | reject — the start anchor lies inside B's active span; absorbing half of B would leave a dead block whose injection point is elided |
 
 Invariants these rules preserve:
 
-- **INV-1** distinct surviving blocks have distinct end anchors.
-- **INV-2** a surviving block's end anchor and summary injection point are
+- **INV-1** distinct surviving blocks have distinct compress calls (one call
+  per block by construction).
+- **INV-2** a surviving block's compress call and summary injection point are
   never elided by another surviving block.
 - **INV-4** a failed compress (thrown validation) mutates no state.
 
@@ -147,11 +152,11 @@ Same-session re-bind is a no-op, so in-flight compress state is never wiped.
 ## Persistence
 
 Only compression blocks are durable — anchors re-derive from history by
-scanning. State rides omp custom entries (`customType: "dcp-state"`, `v: 2`);
-the latest entry on the active branch wins. v1 entries (range-mode era) are
-ignored. Blocks whose anchors no longer resolve at transform time
-(fork/compaction residue) are dropped lazily and the state marked dirty so the
-next flush persists the cleanup.
+scanning. State rides omp custom entries (`customType: "dcp-state"`, `v: 4`);
+the latest entry on the active branch wins. v1–v3 entries (range-mode and
+end-anchor eras) are ignored. Blocks whose anchors or compress call no longer
+resolve at transform time (fork/compaction residue) are dropped lazily and
+the state marked dirty so the next flush persists the cleanup.
 
 ## Errors surface to the model
 

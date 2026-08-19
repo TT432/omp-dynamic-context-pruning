@@ -5,7 +5,7 @@
  * persistence of their own — they are re-derived by scanning the session
  * history for add_anchor tool calls (tool-call ids are stable across reloads).
  *
- * Persistence rides omp's custom session entries (`dcp-state`, v3): the latest
+ * Persistence rides omp's custom session entries (`dcp-state`, v4): the latest
  * entry on the active branch wins. Older versions (and malformed blocks) are
  * ignored.
  */
@@ -13,20 +13,20 @@
 import type { CustomEntry, ExtensionAPI, SessionEntry } from "./omp";
 
 export const PERSIST_TYPE = "dcp-state";
-const PERSIST_VERSION = 3;
+const PERSIST_VERSION = 4;
 
 export interface CompressionBlock {
   id: number;
-  /** Anchor names as the model cited them (display / error messages). */
+  /** Anchor name as the model cited it (display / error messages). */
   startName: string;
   /** tool-call id of the start add_anchor call; null for session_start. */
   startToolCallId: string | null;
-  endName: string;
-  /** tool-call id of the end add_anchor call (always a real anchor). */
-  endToolCallId: string;
   /** Model-authored summary replacing the span. */
   summary: string;
-  /** tool-call id of the compress call itself (kept in context; recorded for traceability). */
+  /**
+   * tool-call id of the compress call itself — the implicit end of the span.
+   * The call and its toolResult stay in context right after the summary.
+   */
   compressCallId: string;
   createdAt: number;
 }
@@ -97,8 +97,6 @@ function isValidBlock(value: unknown): value is CompressionBlock {
   if (!("id" in value) || typeof value.id !== "number") return false;
   if (!("startName" in value) || typeof value.startName !== "string") return false;
   if (!("startToolCallId" in value) || (typeof value.startToolCallId !== "string" && value.startToolCallId !== null)) return false;
-  if (!("endName" in value) || typeof value.endName !== "string") return false;
-  if (!("endToolCallId" in value) || typeof value.endToolCallId !== "string") return false;
   if (!("summary" in value) || typeof value.summary !== "string") return false;
   if (!("compressCallId" in value) || typeof value.compressCallId !== "string") return false;
   return true;
