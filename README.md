@@ -87,8 +87,17 @@ Restart omp. The model gets the `add_anchor` and `compress` tools.
 
 ## Configuration
 
-None. Set `DCP_DEBUG=1` in the environment to write per-pass context snapshots
+Set `DCP_DEBUG=1` in the environment to write per-pass context snapshots
 and structured logs under `~/.omp/agent/logs/dcp/`.
+
+`DCP_REMIND_THRESHOLD` controls the over-threshold compress reminder: when the
+estimated (post-compression) context crosses the threshold, a reminder naming
+the live anchors is appended to the LLM-facing context urging an immediate
+`compress` — dcp is model-driven, and with omp auto-compaction disabled a
+forgotten compress otherwise walks the context past the window and stalls the
+session. Values: `(0,1)` = fraction of the model's context window (default
+`0.8`), `>=1` = absolute tokens, `0` = disabled. The reminder only ever
+touches the outgoing message copy; session history is never modified.
 
 ## Verification
 

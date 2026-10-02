@@ -28,6 +28,7 @@ import {
   resolveSessionId,
   type HandlerDeps,
 } from "./src/hooks";
+import { estimateContextTokens, maybeAppendReminder, REMIND_MARKER } from "./src/remind";
 import { Logger } from "./src/logger";
 import type { AgentMessage, ExtensionAPI, ExtensionContext, SessionEntry, ToolDefinition, ToolResult } from "./src/omp";
 
@@ -485,7 +486,7 @@ const compressTool = createCompressTool({
   const s8 = createSessionState();
   const app8: { customType: string; data: unknown }[] = [];
   const pi8 = makePi(app8);
-  const deps: HandlerDeps = { state: s8, logger, pi: pi8 };
+  const deps: HandlerDeps = { state: s8, logger, pi: pi8, remindThreshold: 0 };
 
   const seeded = createSessionState();
   seeded.sessionId = "sess-life";
@@ -529,7 +530,7 @@ const compressTool = createCompressTool({
   const s9 = createSessionState();
   const tool9 = createCompressTool({ state: s9, logger, zod: zodStub, persist: () => {} });
   const msgs = convo();
-  const deps9: HandlerDeps = { state: s9, logger, pi: makePi([]) };
+  const deps9: HandlerDeps = { state: s9, logger, pi: makePi([]), remindThreshold: 0 };
   // bind first — compress always happens on an already-bound session
   bindSession(deps9, makeCtx(msgs), "test");
   await tool9.execute("tu_c1", { startAnchor: "a1", summary: "D1 again." }, undefined, undefined, makeCtx(msgs.slice(0, 9)));
@@ -662,6 +663,60 @@ const compressTool = createCompressTool({
   assert(!render.includes("t_d"), "span tail elided up to the compress call");
   assert(render.includes("t_x"), "compress call kept as the span end");
   assert(render.includes("S: done."), "summary injected");
+}
+
+// ---------------------------------------------------------------------------
+// 14. over-threshold compress reminder (LLM-facing copy only, never persisted)
+// ---------------------------------------------------------------------------
+{
+  const withWindow = (msgs: AgentMessage[], contextWindow?: number): ExtensionContext => ({
+    ...makeCtx(msgs),
+    model: contextWindow === undefined ? undefined : { id: "m", contextWindow },
+  });
+  const used = (totalTokens: number): AgentMessage => ({
+    role: "assistant",
+    content: [txt("turn done.")],
+    usage: { input: totalTokens, output: 0, totalTokens },
+  });
+
+  // fraction of the model window: 900/1000 >= 0.8 → fires, names live anchors
+  const msgs14 = convo();
+  const hot = [...msgs14, used(900)];
+  const out14 = maybeAppendReminder(hot, withWindow(hot, 1000), 0.8);
+  const last14 = out14[out14.length - 1];
+  const lastBlock = Array.isArray(last14.content) ? (last14.content[0] as { text?: string }) : {};
+  const lastText = lastBlock.text ?? "";
+  assert(out14.length === hot.length + 1 && last14.role === "user", "reminder appended as a trailing user message over threshold");
+  assert(lastText.includes(REMIND_MARKER) && lastText.includes("900"), "reminder reports the estimated tokens");
+  assert(lastText.includes('"a1"') && lastText.includes('"session_start"'), "reminder lists the available anchors");
+
+  // under threshold → same reference back, nothing appended
+  const cool = [...convo(), used(500)];
+  assert(maybeAppendReminder(cool, withWindow(cool, 1000), 0.8) === cool, "no reminder under the threshold");
+
+  // absolute token threshold; 0 disables even when far over
+  assert(maybeAppendReminder(cool, withWindow(cool, 1000), 100).length === cool.length + 1, "absolute token threshold fires");
+  assert(maybeAppendReminder(hot, withWindow(hot, 1000), 0) === hot, "threshold 0 disables the reminder");
+
+  // fraction without a resolvable window → undeterminable, stay silent
+  assert(maybeAppendReminder(hot, withWindow(hot), 0.8) === hot, "no reminder when the window is unknown");
+  // absolute threshold still works without a window
+  assert(maybeAppendReminder(hot, withWindow(hot), 100).length === hot.length + 1, "absolute threshold needs no window");
+
+  // estimate: usage anchor + local tail; no usage → whole-conversation heuristic
+  const tail = [...convo(), used(100), tres("tu_tail", "bash", "x".repeat(400))];
+  assert(estimateContextTokens(tail) === 100 + Math.ceil(400 / 4), "estimate anchors on usage and counts the tail locally");
+  const bigText: AgentMessage[] = [{ role: "user", content: [txt("y".repeat(4000))] }];
+  assert(estimateContextTokens(bigText) === 1000, "estimate falls back to the chars/4 heuristic without usage");
+  assert(maybeAppendReminder(bigText, withWindow(bigText, 1000), 0.8).length === 2, "heuristic estimate can trigger the reminder");
+
+  // end-to-end through the context handler: reminder in the outgoing copy only
+  const s14 = createSessionState();
+  const deps14: HandlerDeps = { state: s14, logger, pi: makePi([]), remindThreshold: 0.8 };
+  bindSession(deps14, makeCtx(hot), "test");
+  const handled = createContextHandler(deps14)({ messages: clone(hot) }, withWindow(hot, 1000));
+  assert(JSON.stringify(handled.messages[handled.messages.length - 1]).includes(REMIND_MARKER), "context handler appends the reminder");
+  assert(!JSON.stringify(hot).includes(REMIND_MARKER), "stored messages never gain the reminder");
 }
 
 console.log(failures === 0 ? "\nALL OK" : `\n${failures} FAILURE(S)`);

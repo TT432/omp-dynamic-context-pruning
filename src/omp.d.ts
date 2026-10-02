@@ -44,6 +44,7 @@ export interface MessageUsage {
   output?: number;
   cacheRead?: number;
   cacheWrite?: number;
+  totalTokens?: number;
 }
 
 export interface AgentMessage {
@@ -118,8 +119,8 @@ export interface ExtensionContext {
   sessionManager: SessionManager;
   /** Live session model; contextWindow is the authoritative window size. */
   model?: { id?: string; contextWindow?: number; [k: string]: unknown };
-  /** Optional usage snapshot; `limit` is a fallback window when model is unset. */
-  getContextUsage?(): { tokens?: number; limit?: number } | undefined;
+  /** Optional usage snapshot; contextWindow (omp ≥18) or limit is a fallback window when model is unset. */
+  getContextUsage?(): { tokens?: number; contextWindow?: number; limit?: number } | undefined;
   isIdle(): boolean;
 }
 

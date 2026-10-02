@@ -27,8 +27,14 @@ export default function dcpExtension(pi: ExtensionAPI): void {
   const debugEnv = typeof process !== "undefined" ? (process.env.DCP_DEBUG ?? "") : "";
   const logger = new Logger(debugEnv !== "" && debugEnv !== "0" && debugEnv !== "false");
 
+  // DCP_REMIND_THRESHOLD: (0,1) = fraction of the context window, >=1 =
+  // absolute tokens, <=0 disables the over-threshold compress reminder.
+  const remindRaw = typeof process !== "undefined" ? (process.env.DCP_REMIND_THRESHOLD ?? "").trim() : "";
+  const remindParsed = remindRaw === "" ? Number.NaN : Number(remindRaw);
+  const remindThreshold = Number.isNaN(remindParsed) ? 0.8 : remindParsed;
+
   const state = createSessionState();
-  const deps = { state, logger, pi };
+  const deps = { state, logger, pi, remindThreshold };
 
   // Core pipeline: apply compression blocks to the outgoing message copy.
   pi.on("context", createContextHandler(deps));

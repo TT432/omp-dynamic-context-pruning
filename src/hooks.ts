@@ -26,11 +26,14 @@ import type { Logger } from "./logger";
 import type { SessionState } from "./state";
 import { loadSessionState, resetForSession, saveSessionState } from "./state";
 import { applyCompressions } from "./transform";
+import { maybeAppendReminder } from "./remind";
 
 export interface HandlerDeps {
   state: SessionState;
   logger: Logger;
   pi: ExtensionAPI;
+  /** DCP_REMIND_THRESHOLD: (0,1) fraction of window, >=1 absolute tokens, <=0 disables. */
+  remindThreshold: number;
 }
 
 /** Prefer stable session id; fall back to session file path for ephemeral hosts. */
@@ -150,8 +153,9 @@ export function createContextHandler(deps: HandlerDeps) {
 
     const messages = cloneMessages(event.messages ?? []);
     const transformed = applyCompressions(deps.state, deps.logger, messages);
-    deps.logger.saveContext(deps.state.sessionId ?? "session", transformed);
-    return { messages: transformed };
+    const outgoing = maybeAppendReminder(transformed, ctx, deps.remindThreshold);
+    deps.logger.saveContext(deps.state.sessionId ?? "session", outgoing);
+    return { messages: outgoing };
   };
 }
 

@@ -132,7 +132,7 @@ src/
   state.ts      SessionState, CompressionBlock, dcp-state (v3) persistence
   tools.ts      add_anchor + compress tool factories
   transform.ts  the context-transform heart: elide / strip / inject
-  hooks.ts      session lifecycle: bind, flush, compact, context handler
+  remind.ts     over-threshold compress reminder (LLM-facing copy only)
   prompts.ts    tool descriptions, marker + summary formats
   logger.ts     debug logger (~/.omp/agent/logs/dcp, DCP_DEBUG=1)
 smoke-test.ts   bun smoke test over synthetic omp messages
@@ -145,9 +145,25 @@ smoke-test.ts   bun smoke test over synthetic omp messages
 | `session_start` / `session_switch` | bind: reset if the session id changed, load latest `dcp-state` entry, track latest compaction timestamp |
 | `session_before_switch` / `session_shutdown` | flush dirty state into the current session |
 | `session_compact` | clear all blocks (anchors may be compacted away) + persist the cleared state |
-| `context` | lazy-bind if unbound; reconcile omp-side compaction by branch timestamps; clone → transform → return |
+| `context` | lazy-bind if unbound; reconcile omp-side compaction by branch timestamps; clone → transform → append reminder if over threshold → return |
 
 Same-session re-bind is a no-op, so in-flight compress state is never wiped.
+
+## Over-threshold reminder
+
+dcp is model-driven: nothing forces a compress, and omp auto-compaction is
+commonly disabled in favor of dcp. A model that forgets walks the context past
+the window and the session stalls (observed 2026-10-01: 264k on a 256k
+window, turns dying with `stopReason: "length"`). When the estimated
+post-transform context crosses `DCP_REMIND_THRESHOLD` ((0,1) = fraction of the
+model window, default 0.8; >=1 = absolute tokens; <=0 = off), the context
+handler appends a synthetic user message naming the live anchors and demanding
+an immediate compress. It lives only in the LLM-facing copy — never persisted.
+
+Estimate: newest assistant usage report anchors the total, tail counted at
+~4 chars/token (see `estimateContextTokens`). Known limitation: right after a
+compress the newest usage report can still be the stale pre-compression one,
+so the reminder may fire once more before the next turn corrects it.
 
 ## Persistence
 
