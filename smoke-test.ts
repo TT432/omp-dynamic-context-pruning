@@ -110,6 +110,8 @@ function makeCtx(messages: AgentMessage[], sessionId = "sess-1"): ExtensionConte
 const zodStub = {
   object: (shape: unknown) => ({ shape }),
   string: () => ({}),
+  boolean: () => ({}),
+  optional: (schema: unknown) => schema,
 } as unknown as ExtensionAPI["zod"];
 
 function makePi(appended: { customType: string; data: unknown }[]): ExtensionAPI {
@@ -341,7 +343,7 @@ const compressTool = createCompressTool({
     { role: "assistant", content: [tu("tu_c3", "compress", { startAnchor: "session_start", summary: "DS" })] },
     tres("tu_c3", "compress", "ok"),
   ];
-  await tool2.execute("tu_c3", { startAnchor: "session_start", summary: "DS: early exploration done." }, undefined, undefined, makeCtx(mini.slice(0, 5)));
+  await tool2.execute("tu_c3", { startAnchor: "session_start", summary: "DS: early exploration done.", force: true }, undefined, undefined, makeCtx(mini.slice(0, 5)));
   assert(s2.blocks.length === 1 && s2.blocks[0].startToolCallId === null, "session_start block stores a null startToolCallId");
 
   // out = [prompt, MARKER, SUMMARY, compress(tu_c3), tr_c3]
@@ -385,6 +387,11 @@ const compressTool = createCompressTool({
     /contains no messages/,
     "empty range rejected (anchor immediately precedes the compress call)",
   );
+  await assertThrows(
+    () => tool3.execute("tu_e4", { startAnchor: "session_start", summary: "x" }, undefined, undefined, ctx),
+    /force=true/,
+    "session_start compression without force is rejected (amnesia guard)",
+  );
   assert(s3.blocks.length === 0, "failed compresses record no blocks");
 
   // start anchor inside an active compression → reject; reaching back across
@@ -419,7 +426,7 @@ const compressTool = createCompressTool({
   // absorption: compress from an earlier anchor reaching across the prior block
   const res = await tool4.execute(
     "tu_c3",
-    { startAnchor: "session_start", summary: "everything so far" },
+    { startAnchor: "session_start", summary: "everything so far", force: true },
     undefined,
     undefined,
     makeCtx(wide.slice(0, 11)),
@@ -571,7 +578,7 @@ const compressTool = createCompressTool({
   // the exact reported flow: compress right after the anchor was added
   const res = await tool10.execute(
     "tu_c9",
-    { startAnchor: "session_start", summary: "S:摸底完成。" },
+    { startAnchor: "session_start", summary: "S:摸底完成。", force: true },
     undefined,
     undefined,
     makeCtx(live.slice(0, 5)),

@@ -128,6 +128,7 @@ export function createCompressTool(deps: CompressToolDeps): ToolDefinition {
   const parameters = zod.object({
     startAnchor: zod.string({ description: "Anchor where compression starts (consumed); \"session_start\" compresses from the original prompt" }),
     summary: zod.string({ description: "Complete technical summary replacing everything from the anchor up to this compress call; the only record future turns will have" }),
+    force: zod.optional(zod.boolean({ description: 'Required (=true) when startAnchor is "session_start": full-session compression while work is in progress causes amnesia. Confirm only when the current work unit is complete, and make the summary carry 当前任务/刚完成的动作/下一步 (current task, last action, next step).' })),
   });
 
   return {
@@ -138,7 +139,7 @@ export function createCompressTool(deps: CompressToolDeps): ToolDefinition {
     async execute(toolCallId, params, _signal, _onUpdate, ctx): Promise<ToolResult> {
       // omp validates params against the zod schema before execute; fields are
       // still re-checked below for precise error messages.
-      const p = params as { startAnchor?: unknown; summary?: unknown };
+      const p = params as { startAnchor?: unknown; summary?: unknown; force?: unknown };
       if (typeof p.startAnchor !== "string" || p.startAnchor.trim().length === 0) {
         throw new Error('compress requires a non-empty string "startAnchor"');
       }
@@ -147,6 +148,14 @@ export function createCompressTool(deps: CompressToolDeps): ToolDefinition {
       }
       const startName = p.startAnchor.trim();
       const summary = p.summary;
+
+      // Full-session compression is the known amnesia footgun: require an
+      // explicit opt-in so it is never the accidental default mid-task.
+      if (startName === SESSION_START_ANCHOR && p.force !== true) {
+        throw new Error(
+          'Refusing to compress from "session_start" without force=true. Full-session compression discards all working context; if a work unit is still active this causes amnesia. Only confirm when the unit is complete, and the summary MUST state: 当前任务 / 刚完成的动作 / 下一步具体动作.',
+        );
+      }
 
       const messages = branchMessages(ctx);
       if (messages.length === 0) {

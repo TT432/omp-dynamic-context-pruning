@@ -11,7 +11,9 @@ export const COMPRESS_PROMPT = `Replace everything from a start anchor up to thi
 
 Semantics: everything after the start anchor up to this compress call is replaced by your summary, which appears right before the compress call; the compress call and its confirmation stay in your context, so later turns can see the compression happened. The start anchor is consumed. Earlier compressions whose compress call lies before the start anchor stay in place — their summaries and yours accumulate in order. A span that reaches back across a prior compression absorbs it entirely, so carry its key points into your new summary.
 
-Write summaries that fully preserve decisions, code changes, file paths, and outcomes — they are the only record future turns will have of the compressed span. Never compress content you still need verbatim. Errors (unknown anchor, empty range, start anchor inside an active compression) change nothing. Session history is never modified — compression only reshapes what is sent to you.`;
+Write summaries that fully preserve decisions, code changes, file paths, and outcomes — they are the only record future turns will have of the compressed span. Never compress content you still need verbatim. Errors (unknown anchor, empty range, start anchor inside an active compression) change nothing. Session history is never modified — compression only reshapes what is sent to you.
+
+Full-session compression (startAnchor = "session_start") requires force=true: it discards all working context and is the known amnesia footgun. Confirm only when the current work unit is complete, and make that summary state 当前任务 / 刚完成的动作 / 下一步具体动作 (current task, last action, next step).`;
 
 /** Marker injected after the first user message: the virtual session_start anchor. */
 export const SESSION_START_MARKER = `[anchor: session_start — compression origin; cite it as startAnchor to compress from the beginning of the session]`;
