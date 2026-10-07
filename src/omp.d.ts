@@ -216,12 +216,14 @@ export interface TurnEndEvent {
 }
 
 // ---------------------------------------------------------------------------
-// Zod-like schema (omp injects zod/v4)
+// Zod-like schema (omp injects a zod-like object with no top-level `optional`;
+// use the schema instance method `.optional()` instead — verified 2026-10-07).
 // ---------------------------------------------------------------------------
 
 export interface ZodSchema<T = unknown> {
   _def: unknown;
   _type?: T;
+  optional: () => ZodSchema<T | undefined>;
 }
 
 export interface ZodNamespace {
@@ -231,7 +233,6 @@ export interface ZodNamespace {
   array: <T>(schema: ZodSchema<T>) => ZodSchema<T[]>;
   object: <T extends Record<string, ZodSchema>>(shape: T) => ZodSchema<object>;
   enum: <T extends string>(values: readonly T[], opts?: { description?: string }) => ZodSchema<T>;
-  optional: <T>(schema: ZodSchema<T>) => ZodSchema<T | undefined>;
 }
 
 // ---------------------------------------------------------------------------

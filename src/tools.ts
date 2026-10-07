@@ -128,7 +128,7 @@ export function createCompressTool(deps: CompressToolDeps): ToolDefinition {
   const parameters = zod.object({
     startAnchor: zod.string({ description: "Anchor where compression starts (consumed); \"session_start\" compresses from the original prompt" }),
     summary: zod.string({ description: "Complete technical summary replacing everything from the anchor up to this compress call; the only record future turns will have" }),
-    force: zod.optional(zod.boolean({ description: 'Required (=true) when startAnchor is "session_start": full-session compression while work is in progress causes amnesia. Confirm only when the current work unit is complete, and make the summary carry 当前任务/刚完成的动作/下一步 (current task, last action, next step).' })),
+    force: zod.boolean({ description: 'Required (=true) when startAnchor is "session_start": full-session compression while work is in progress causes amnesia. Confirm only when the current work unit is complete, and make the summary carry 当前任务/刚完成的动作/下一步 (current task, last action, next step).' }).optional(),
   });
 
   return {
