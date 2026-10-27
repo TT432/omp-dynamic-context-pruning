@@ -90,22 +90,39 @@ Restart omp. The model gets the `add_anchor` and `compress` tools.
 Set `DCP_DEBUG=1` in the environment to write per-pass context snapshots
 and structured logs under `~/.omp/agent/logs/dcp/`.
 
-`DCP_REMIND_THRESHOLD` controls the over-threshold compress reminder: when the
-estimated (post-compression) context crosses the threshold, a reminder naming
-the live anchors is appended to the LLM-facing context urging an immediate
-`compress` — dcp is model-driven, and with omp auto-compaction disabled a
-forgotten compress otherwise walks the context past the window and stalls the
-session. Values: `(0,1)` = fraction of the model's context window (default
-`0.8`), `>=1` = absolute tokens, `0` = disabled. The reminder only ever
+`DCP_REMIND_THRESHOLD` controls the token-pressure reminder: when the estimated
+(post-compression) context crosses the threshold, a `[dcp:context]` reminder
+naming the live anchors is appended to the LLM-facing context urging an
+immediate `compress` — dcp is model-driven, and with omp auto-compaction
+disabled a forgotten compress otherwise walks the context past the window and
+stalls the session. Values: `(0,1)` = fraction of the model's context window
+(default `0.4`), `>=1` = absolute tokens, `0` = disabled.
+
+Two further triggers fire without any token pressure:
+
+- `[dcp:unit]` — the newest `todo` result reports a finished item set
+  (`All items complete` / `Remaining items (0)`): the work-unit boundary is
+  observable rather than judged, so the reminder demands an anchor for the
+  next unit plus a compress of the finished one.
+- `[dcp:budget]` — N tool calls have run since the last compress.
+  `DCP_REMIND_TOOLCALLS` sets N (default `40`, observed unit size
+  ~36 calls/todo item in 20 sessions), `0` = disabled.
+
+One reminder at most is appended per request, with priority
+token > unit > budget. All three stop once the span is compressed, because
+they are computed on the transformed message copy. The reminder only ever
 touches the outgoing message copy; session history is never modified.
 
 ## Verification
 
-- `bunx tsc --noEmit` — type-checks clean.
+- `bunx tsc --noEmit` — type-checks clean. Without bun, `node node_modules/typescript/bin/tsc --noEmit`
+  also works (Node 24 is enough).
 - `bun smoke-test.ts` — exercises the full pipeline (anchor scanning, both
   tools, transform, accumulation/absorption, session_start, validation errors,
   persistence round trip, session lifecycle, orphan cleanup) against synthetic
-  omp messages.
+  omp messages, plus the three reminder triggers. On a bun-less Windows host:
+  `node --experimental-strip-types --experimental-loader <loader> smoke-test.ts`
+  with a resolver hook that maps extensionless relative imports to `.ts` files.
 
 See [`docs/design.md`](./docs/design.md) for the architecture and invariants.
 

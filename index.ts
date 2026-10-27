@@ -22,19 +22,20 @@ import {
   createSessionSwitchHandler,
 } from "./src/hooks";
 import { createAddAnchorTool, createCompressTool } from "./src/tools";
+import { parseRemindPolicy } from "./src/remind";
 
 export default function dcpExtension(pi: ExtensionAPI): void {
   const debugEnv = typeof process !== "undefined" ? (process.env.DCP_DEBUG ?? "") : "";
   const logger = new Logger(debugEnv !== "" && debugEnv !== "0" && debugEnv !== "false");
 
-  // DCP_REMIND_THRESHOLD: (0,1) = fraction of the context window, >=1 =
-  // absolute tokens, <=0 disables the over-threshold compress reminder.
-  const remindRaw = typeof process !== "undefined" ? (process.env.DCP_REMIND_THRESHOLD ?? "").trim() : "";
-  const remindParsed = remindRaw === "" ? Number.NaN : Number(remindRaw);
-  const remindThreshold = Number.isNaN(remindParsed) ? 0.8 : remindParsed;
+  // DCP_REMIND_THRESHOLD: (0,1) = fraction of the context window (default 0.4),
+  // >=1 = absolute tokens, <=0 disables the token trigger.
+  // DCP_REMIND_TOOLCALLS: tool calls since the last compress before nudging
+  // (default 40), <=0 disables the tool-call trigger.
+  const remind = parseRemindPolicy(typeof process !== "undefined" ? process.env : {});
 
   const state = createSessionState();
-  const deps = { state, logger, pi, remindThreshold };
+  const deps = { state, logger, pi, remind };
 
   // Core pipeline: apply compression blocks to the outgoing message copy.
   pi.on("context", createContextHandler(deps));

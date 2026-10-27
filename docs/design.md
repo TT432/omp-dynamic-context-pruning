@@ -132,7 +132,7 @@ src/
   state.ts      SessionState, CompressionBlock, dcp-state (v3) persistence
   tools.ts      add_anchor + compress tool factories
   transform.ts  the context-transform heart: elide / strip / inject
-  remind.ts     over-threshold compress reminder (LLM-facing copy only)
+  remind.ts     compress reminders: token budget, todo-set completion, tool-call budget
   prompts.ts    tool descriptions, marker + summary formats
   logger.ts     debug logger (~/.omp/agent/logs/dcp, DCP_DEBUG=1)
 smoke-test.ts   bun smoke test over synthetic omp messages
@@ -145,25 +145,33 @@ smoke-test.ts   bun smoke test over synthetic omp messages
 | `session_start` / `session_switch` | bind: reset if the session id changed, load latest `dcp-state` entry, track latest compaction timestamp |
 | `session_before_switch` / `session_shutdown` | flush dirty state into the current session |
 | `session_compact` | clear all blocks (anchors may be compacted away) + persist the cleared state |
-| `context` | lazy-bind if unbound; reconcile omp-side compaction by branch timestamps; clone → transform → append reminder if over threshold → return |
+| `context` | lazy-bind if unbound; reconcile omp-side compaction by branch timestamps; clone → transform → append at most one reminder → return |
 
 Same-session re-bind is a no-op, so in-flight compress state is never wiped.
 
-## Over-threshold reminder
+## Compress reminders
 
 dcp is model-driven: nothing forces a compress, and omp auto-compaction is
 commonly disabled in favor of dcp. A model that forgets walks the context past
 the window and the session stalls (observed 2026-10-01: 264k on a 256k
-window, turns dying with `stopReason: "length"`). When the estimated
-post-transform context crosses `DCP_REMIND_THRESHOLD` ((0,1) = fraction of the
-model window, default 0.8; >=1 = absolute tokens; <=0 = off), the context
-handler appends a synthetic user message naming the live anchors and demanding
-an immediate compress. It lives only in the LLM-facing copy — never persisted.
+window, turns dying with `stopReason: "length"`). Three triggers, all computed
+on the already-transformed copy and all appended as a synthetic user message
+that is never persisted:
+
+| Marker | Fires when | Configuration |
+| ------ | ---------- | ------------- |
+| `[dcp:context]` | estimated post-transform context crosses the token budget | `DCP_REMIND_THRESHOLD`: (0,1) = fraction of the model window (default 0.4); >=1 = absolute tokens; <=0 = off |
+| `[dcp:unit]` | the newest `todo` result reports a finished item set (`All items complete` / `Remaining items (0)`) | none — the boundary is observable, not judged |
+| `[dcp:budget]` | N tool calls have run since the last compress | `DCP_REMIND_TOOLCALLS` (default 40, <=0 = off) |
+
+At most one reminder is appended per request; priority is
+`[dcp:context]` > `[dcp:unit]` > `[dcp:budget]`. Because the counters are
+computed after the transform, a compress resets them and the reminders stop.
 
 Estimate: newest assistant usage report anchors the total, tail counted at
 ~4 chars/token (see `estimateContextTokens`). Known limitation: right after a
 compress the newest usage report can still be the stale pre-compression one,
-so the reminder may fire once more before the next turn corrects it.
+so the token reminder may fire once more before the next turn corrects it.
 
 ## Persistence
 

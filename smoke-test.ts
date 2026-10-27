@@ -28,7 +28,7 @@ import {
   resolveSessionId,
   type HandlerDeps,
 } from "./src/hooks";
-import { estimateContextTokens, maybeAppendReminder, REMIND_MARKER } from "./src/remind";
+import { estimateContextTokens, maybeAppendReminder, REMIND_MARKER, UNIT_MARKER, BUDGET_MARKER, parseRemindPolicy, DEFAULT_TOKEN_THRESHOLD, DEFAULT_TOOLCALL_BUDGET, toolCallsSinceLastCompress, finishedTodoSet } from "./src/remind";
 import { Logger } from "./src/logger";
 import type { AgentMessage, ExtensionAPI, ExtensionContext, SessionEntry, ToolDefinition, ToolResult } from "./src/omp";
 
@@ -42,6 +42,12 @@ function assert(cond: boolean, msg: string): void {
     console.log("ok:", msg);
   }
 }
+/** Reminder policy with only the token trigger active (unit/budget disabled). */
+function tok(tokenThreshold: number) {
+  return { tokenThreshold, toolCallBudget: 0 };
+}
+const REMIND_OFF = tok(0);
+
 async function assertThrows(fn: () => Promise<unknown>, pattern: RegExp, msg: string): Promise<void> {
   try {
     await fn();
@@ -80,6 +86,15 @@ function textOf(result: ToolResult): string {
   return typeof block.text === "string" ? block.text : "";
 }
 
+/** Text of the first content block of a message, or "". */
+function firstText(message: AgentMessage): string {
+  const content = message.content;
+  if (!Array.isArray(content)) return "";
+  const block = content[0];
+  if (typeof block !== "object" || block === null || !("text" in block)) return "";
+  return typeof block.text === "string" ? block.text : "";
+}
+
 function entriesOf(messages: AgentMessage[]): SessionEntry[] {
   return messages.map((m, i) => ({
     type: "message",
@@ -105,13 +120,27 @@ function makeCtx(messages: AgentMessage[], sessionId = "sess-1"): ExtensionConte
   };
 }
 
-// Minimal zod stand-in: the tool factories only build the parameter schema at
-// registration time; execute() re-validates fields itself.
+/**
+ * Minimal zod-like schema. Methods are chainable and `.optional()` is an
+ * instance method — the host zod has no top-level `optional` (verified
+ * 2026-10-07, tools.ts uses `schema.optional()`).
+ */
+type StubSchema = Record<string, unknown> & {
+  optional: () => StubSchema;
+  describe: (text: string) => StubSchema;
+  min: (n: number) => StubSchema;
+};
+function stubSchema(extra: Record<string, unknown> = {}): StubSchema {
+  const schema: StubSchema = { ...extra, optional: () => schema, describe: () => schema, min: () => schema };
+  return schema;
+}
 const zodStub = {
-  object: (shape: unknown) => ({ shape }),
-  string: () => ({}),
-  boolean: () => ({}),
-  optional: (schema: unknown) => schema,
+  object: (shape: unknown) => stubSchema({ shape }),
+  string: () => stubSchema(),
+  boolean: () => stubSchema(),
+  number: () => stubSchema(),
+  array: (item: unknown) => stubSchema({ item }),
+  enum: (values: unknown) => stubSchema({ values }),
 } as unknown as ExtensionAPI["zod"];
 
 function makePi(appended: { customType: string; data: unknown }[]): ExtensionAPI {
@@ -493,7 +522,7 @@ const compressTool = createCompressTool({
   const s8 = createSessionState();
   const app8: { customType: string; data: unknown }[] = [];
   const pi8 = makePi(app8);
-  const deps: HandlerDeps = { state: s8, logger, pi: pi8, remindThreshold: 0 };
+  const deps: HandlerDeps = { state: s8, logger, pi: pi8, remind: REMIND_OFF };
 
   const seeded = createSessionState();
   seeded.sessionId = "sess-life";
@@ -537,7 +566,7 @@ const compressTool = createCompressTool({
   const s9 = createSessionState();
   const tool9 = createCompressTool({ state: s9, logger, zod: zodStub, persist: () => {} });
   const msgs = convo();
-  const deps9: HandlerDeps = { state: s9, logger, pi: makePi([]), remindThreshold: 0 };
+  const deps9: HandlerDeps = { state: s9, logger, pi: makePi([]), remind: REMIND_OFF };
   // bind first — compress always happens on an already-bound session
   bindSession(deps9, makeCtx(msgs), "test");
   await tool9.execute("tu_c1", { startAnchor: "a1", summary: "D1 again." }, undefined, undefined, makeCtx(msgs.slice(0, 9)));
@@ -689,41 +718,107 @@ const compressTool = createCompressTool({
   // fraction of the model window: 900/1000 >= 0.8 → fires, names live anchors
   const msgs14 = convo();
   const hot = [...msgs14, used(900)];
-  const out14 = maybeAppendReminder(hot, withWindow(hot, 1000), 0.8);
+  const out14 = maybeAppendReminder(hot, withWindow(hot, 1000), tok(0.8));
   const last14 = out14[out14.length - 1];
-  const lastBlock = Array.isArray(last14.content) ? (last14.content[0] as { text?: string }) : {};
-  const lastText = lastBlock.text ?? "";
+  const lastText = firstText(last14);
   assert(out14.length === hot.length + 1 && last14.role === "user", "reminder appended as a trailing user message over threshold");
   assert(lastText.includes(REMIND_MARKER) && lastText.includes("900"), "reminder reports the estimated tokens");
   assert(lastText.includes('"a1"') && lastText.includes('"session_start"'), "reminder lists the available anchors");
 
   // under threshold → same reference back, nothing appended
   const cool = [...convo(), used(500)];
-  assert(maybeAppendReminder(cool, withWindow(cool, 1000), 0.8) === cool, "no reminder under the threshold");
+  assert(maybeAppendReminder(cool, withWindow(cool, 1000), tok(0.8)) === cool, "no reminder under the threshold");
 
   // absolute token threshold; 0 disables even when far over
-  assert(maybeAppendReminder(cool, withWindow(cool, 1000), 100).length === cool.length + 1, "absolute token threshold fires");
-  assert(maybeAppendReminder(hot, withWindow(hot, 1000), 0) === hot, "threshold 0 disables the reminder");
+  assert(maybeAppendReminder(cool, withWindow(cool, 1000), tok(100)).length === cool.length + 1, "absolute token threshold fires");
+  assert(maybeAppendReminder(hot, withWindow(hot, 1000), tok(0)) === hot, "threshold 0 disables the reminder");
 
   // fraction without a resolvable window → undeterminable, stay silent
-  assert(maybeAppendReminder(hot, withWindow(hot), 0.8) === hot, "no reminder when the window is unknown");
+  assert(maybeAppendReminder(hot, withWindow(hot), tok(0.8)) === hot, "no reminder when the window is unknown");
   // absolute threshold still works without a window
-  assert(maybeAppendReminder(hot, withWindow(hot), 100).length === hot.length + 1, "absolute threshold needs no window");
+  assert(maybeAppendReminder(hot, withWindow(hot), tok(100)).length === hot.length + 1, "absolute threshold needs no window");
 
   // estimate: usage anchor + local tail; no usage → whole-conversation heuristic
   const tail = [...convo(), used(100), tres("tu_tail", "bash", "x".repeat(400))];
   assert(estimateContextTokens(tail) === 100 + Math.ceil(400 / 4), "estimate anchors on usage and counts the tail locally");
   const bigText: AgentMessage[] = [{ role: "user", content: [txt("y".repeat(4000))] }];
   assert(estimateContextTokens(bigText) === 1000, "estimate falls back to the chars/4 heuristic without usage");
-  assert(maybeAppendReminder(bigText, withWindow(bigText, 1000), 0.8).length === 2, "heuristic estimate can trigger the reminder");
+  assert(maybeAppendReminder(bigText, withWindow(bigText, 1000), tok(0.8)).length === 2, "heuristic estimate can trigger the reminder");
 
   // end-to-end through the context handler: reminder in the outgoing copy only
   const s14 = createSessionState();
-  const deps14: HandlerDeps = { state: s14, logger, pi: makePi([]), remindThreshold: 0.8 };
+  const deps14: HandlerDeps = { state: s14, logger, pi: makePi([]), remind: tok(0.8) };
   bindSession(deps14, makeCtx(hot), "test");
   const handled = createContextHandler(deps14)({ messages: clone(hot) }, withWindow(hot, 1000));
   assert(JSON.stringify(handled.messages[handled.messages.length - 1]).includes(REMIND_MARKER), "context handler appends the reminder");
   assert(!JSON.stringify(hot).includes(REMIND_MARKER), "stored messages never gain the reminder");
+}
+
+// ---------------------------------------------------------------------------
+// 15. work-unit and tool-call-budget reminders
+// ---------------------------------------------------------------------------
+{
+  const win = (msgs: AgentMessage[], contextWindow: number): ExtensionContext => ({
+    ...makeCtx(msgs),
+    model: { id: "m", contextWindow },
+  });
+  const used = (totalTokens: number): AgentMessage => ({
+    role: "assistant",
+    content: [txt("turn done.")],
+    usage: { input: totalTokens, output: 0, totalTokens },
+  });
+  const budgetPolicy = { tokenThreshold: 0, toolCallBudget: 40 };
+  const ctx0 = win(convo(), 1000);
+
+  // policy parsing: defaults + env overrides
+  assert(DEFAULT_TOKEN_THRESHOLD === 0.4 && parseRemindPolicy({}).tokenThreshold === 0.4, "default token threshold is 0.4");
+  assert(DEFAULT_TOOLCALL_BUDGET === 40 && parseRemindPolicy({}).toolCallBudget === 40, "default tool-call budget is 40");
+  assert(parseRemindPolicy({ DCP_REMIND_THRESHOLD: "0.7" }).tokenThreshold === 0.7, "env overrides the token threshold");
+  assert(parseRemindPolicy({ DCP_REMIND_TOOLCALLS: "12" }).toolCallBudget === 12, "env overrides the tool-call budget");
+  assert(parseRemindPolicy({ DCP_REMIND_TOOLCALLS: "0" }).toolCallBudget === 0, "0 disables the tool-call budget");
+  assert(parseRemindPolicy({ DCP_REMIND_THRESHOLD: "abc" }).tokenThreshold === DEFAULT_TOKEN_THRESHOLD, "garbage env falls back to the default");
+
+  // unit boundary: the newest todo result reports a completed set
+  const done: AgentMessage[] = [
+    ...convo(),
+    { role: "assistant", content: [tu("td", "todo", { op: "done" })] },
+    tres("td", "todo", "All items complete"),
+  ];
+  assert(finishedTodoSet(done) !== null, "completed todo set detected");
+  const unitOut = maybeAppendReminder(done, ctx0, budgetPolicy);
+  const unitLast = unitOut[unitOut.length - 1];
+  const unitText = firstText(unitLast);
+  assert(unitOut.length === done.length + 1 && unitText.includes(UNIT_MARKER), "todo completion appends the unit reminder");
+  assert(unitText.includes('"a1"'), "unit reminder lists the available anchors");
+
+  // mid-progress todo set is not a boundary
+  const wip: AgentMessage[] = [
+    ...convo(),
+    { role: "assistant", content: [tu("tw", "todo", { op: "done" })] },
+    tres("tw", "todo", "Remaining items (2):"),
+  ];
+  assert(finishedTodoSet(wip) === null, "mid-progress todo set is not a boundary");
+  assert(maybeAppendReminder(wip, ctx0, budgetPolicy) === wip, "no unit reminder while the todo set is in progress");
+
+  // tool-call budget, reset by compress
+  const calls = (n: number): AgentMessage[] => [
+    { role: "user", content: [txt("go")] },
+    { role: "assistant", content: Array.from({ length: n }, (_, i) => tu(`c${i}`, "bash", { command: "x" })) },
+  ];
+  assert(toolCallsSinceLastCompress(calls(39)) === 39, "counts tool calls since the start");
+  assert(toolCallsSinceLastCompress(convo()) === 0, "a compress call resets the count");
+  const under = calls(39);
+  assert(maybeAppendReminder(under, ctx0, budgetPolicy) === under, "no budget reminder under the budget");
+  const at = calls(40);
+  const atOut = maybeAppendReminder(at, ctx0, budgetPolicy);
+  assert(atOut.length === at.length + 1 && JSON.stringify(atOut[atOut.length - 1]).includes(BUDGET_MARKER), "budget reminder fires at the budget");
+  assert(maybeAppendReminder(at, ctx0, { tokenThreshold: 0, toolCallBudget: 0 }) === at, "budget 0 disables the tool-call trigger");
+
+  // one reminder per request; token pressure outranks the unit boundary
+  const hotDone = [...done, used(900)];
+  const hotOut = maybeAppendReminder(hotDone, win(hotDone, 1000), { tokenThreshold: 0.8, toolCallBudget: 1 });
+  assert(hotOut.length === hotDone.length + 1, "exactly one reminder per request");
+  assert(JSON.stringify(hotOut[hotOut.length - 1]).includes(REMIND_MARKER), "token pressure outranks the unit boundary");
 }
 
 console.log(failures === 0 ? "\nALL OK" : `\n${failures} FAILURE(S)`);
