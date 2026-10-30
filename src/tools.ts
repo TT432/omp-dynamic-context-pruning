@@ -27,6 +27,7 @@ import {
   type AnchorRef,
 } from "./anchors";
 import { ADD_ANCHOR_PROMPT, COMPRESS_PROMPT } from "./prompts";
+import { validateSummary } from "./summary";
 
 // ---------------------------------------------------------------------------
 // shared helpers
@@ -127,8 +128,8 @@ export function createCompressTool(deps: CompressToolDeps): ToolDefinition {
   const { state, logger, zod, persist } = deps;
   const parameters = zod.object({
     startAnchor: zod.string({ description: "Anchor where compression starts (consumed); \"session_start\" compresses from the original prompt" }),
-    summary: zod.string({ description: "Complete technical summary replacing everything from the anchor up to this compress call; the only record future turns will have" }),
-    force: zod.boolean({ description: 'Required (=true) when startAnchor is "session_start": full-session compression while work is in progress causes amnesia. Confirm only when the current work unit is complete, and make the summary carry 当前任务/刚完成的动作/下一步 (current task, last action, next step).' }).optional(),
+    summary: zod.string({ description: "Slot-structured summary replacing everything from the anchor up to this compress call; the only record future turns will have. Required slot headers: ## 当前任务 / ## 已完成 / ## 未完成 / ## 约束 / ## 文件与命令 / ## 在跑作业与句柄, in that order; every fact is a `- ` bullet ending in `证据: <locator>`, an empty slot is `- 无`" }),
+    force: zod.boolean({ description: 'Required (=true) when startAnchor is "session_start": full-session compression while work is in progress causes amnesia. Only confirm when the current work unit is complete. The summary must then pass the strict tier: 已完成 and 未完成 carry real content, and every 证据 must be a real locator (path, file:line, session id, URI or command).' }).optional(),
   });
 
   return {
@@ -156,6 +157,10 @@ export function createCompressTool(deps: CompressToolDeps): ToolDefinition {
           'Refusing to compress from "session_start" without force=true. Full-session compression discards all working context; if a work unit is still active this causes amnesia. Only confirm when the unit is complete, and the summary MUST state: 当前任务 / 刚完成的动作 / 下一步具体动作.',
         );
       }
+
+      // Schema check runs before any branch scanning or state mutation (INV-4).
+      // The strict tier applies to exactly the calls that discard everything.
+      validateSummary(summary, { full: startName === SESSION_START_ANCHOR });
 
       const messages = branchMessages(ctx);
       if (messages.length === 0) {

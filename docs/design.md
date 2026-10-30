@@ -52,14 +52,21 @@ which is exactly how the first anchor-mode build failed in production.)
 
 ## compress semantics
 
-`compress({ startAnchor, summary })` resolves the anchor on the persisted
-branch (`ctx.sessionManager.getBranch()`), validates, and records a
+`compress({ startAnchor, summary, force? })` resolves the anchor on the
+persisted branch (`ctx.sessionManager.getBranch()`), validates, and records a
 compression block. **The end of the span is implicit: the compress call
 itself.** There is no `endAnchor` — a span always runs from the start anchor
 to the point where the model calls compress. When execute runs, the in-flight
 compress call is usually not yet appended to the branch; it lands at the end,
 so the end position falls back to `messages.length` (validation and elision
 counting only — the durable identity is the compress call's tool-call id).
+
+Two gates run before any branch scanning, so a rejected call mutates nothing
+(INV-4):
+
+1. `startAnchor === "session_start"` requires `force: true`;
+2. `validateSummary(summary, { full: startAnchor === "session_start" })` —
+   the fixed-slot schema below; `full` selects the strict tier.
 
 ```ts
 {
@@ -122,6 +129,39 @@ Invariants these rules preserve:
 Tool_use/tool_result pairs are always stripped together (no orphan blocks);
 messages left empty are dropped.
 
+## Summary schema (`src/summary.ts`)
+
+A free-form summary fails in two ways that a later turn cannot detect: it
+drops what the model forgot to write (session 01a18b4e, 2026-10-30: 22
+full-session compressions, several of them silently dropping the live user
+instruction), and its prose cannot be distinguished from invention. The
+schema makes both checkable at the tool boundary:
+
+| Slot (fixed order) | Purpose |
+| --- | --- |
+| `当前任务` | what is actually being worked on — mandatory, never `无` |
+| `已完成` | actions/conclusions reached in the span |
+| `未完成` | the next concrete action |
+| `约束` | user requirements, invariants, prohibitions |
+| `文件与命令` | key paths, entry points, reproducible commands |
+| `在跑作业与句柄` | background jobs, subagent ids, service ports |
+
+Structure rules (all tiers): each slot exactly once and in order; every line
+inside a slot is `- <fact> 证据: <locator>`; an empty slot is `- 无`; no
+free-form preamble before `## 当前任务`; facts ≤ 600 chars so the summary
+carries pointers instead of pasted content; `证据` must not be `无`.
+
+Evidence is the externalization mechanism: a fact names where it lives
+(path, `file:line`, session id, tool name, command) so the next turn can
+re-read the source instead of trusting the paraphrase.
+
+Strict tier (`full: true`, i.e. `session_start` + `force`): `已完成` and
+`未完成` must carry real content, and every evidence pointer must contain a
+locator (`:`, `#`, `/`, `\`, `@`). This is the deliberate "cost" of
+full-session compression — it discards the most and therefore must prove the
+most. Tier 1 stays cheap (a vague pointer is tolerated) so ordinary
+compressions do not lose their main benefit.
+
 ## Modules
 
 ```
@@ -131,6 +171,7 @@ src/
   anchors.ts    anchor model: scanAnchors, session_start, toolCall/toolResult lookup
   state.ts      SessionState, CompressionBlock, dcp-state (v3) persistence
   tools.ts      add_anchor + compress tool factories
+  summary.ts    summary schema: fixed slots, evidence pointers, strict tier
   transform.ts  the context-transform heart: elide / strip / inject
   remind.ts     compress reminders: token budget, todo-set completion, tool-call budget
   prompts.ts    tool descriptions, marker + summary formats
@@ -186,7 +227,10 @@ the state marked dirty so the next flush persists the cleanup.
 
 Both tools fail by throwing — the model sees the error tool_result and no
 state changes. Unknown-anchor errors list the available anchors so the model
-can recover immediately.
+can recover immediately. Schema errors name the offending line and restate the
+required shape (slot list, `- ` bullet form, `证据: <定位>` suffix), so a
+rejected compression comes back as a concrete rewrite instruction rather than
+a generic refusal.
 
 ## Deliberately removed (vs. the range-mode port)
 

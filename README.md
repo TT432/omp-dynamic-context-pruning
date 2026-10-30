@@ -17,10 +17,10 @@ Two tools are exposed to the model:
   tool call itself is the anchor: its provider-assigned tool-call id is a
   stable, globally unique identity. Names are unique per session;
   `session_start` is reserved.
-- **`compress({ startAnchor, summary })`** — replaces everything from the
-  start anchor up to the compress call itself with a technical summary **the
-  model writes itself**. The end of the span is implicit: the compress call's
-  own position.
+- **`compress({ startAnchor, summary, force? })`** — replaces everything from
+  the start anchor up to the compress call itself with a **slot-structured
+  summary the model writes itself** (see below). The end of the span is
+  implicit: the compress call's own position.
 
 A virtual **`session_start`** anchor is always injected right after the
 original user prompt, so everything since the beginning of the session can be
@@ -51,6 +51,33 @@ prompt · [anchor: session_start] · work1 · [Compressed: a1 → here] desc · 
 - Session history is never modified; compression only reshapes what is sent to
   the model. Compression blocks persist across session resume (omp custom
   entries) and are dropped automatically if omp compacts the session.
+
+### Summary schema
+
+A free-form summary is a lossy paraphrase: what the model omits is gone, and
+nothing in the text lets a later turn tell a remembered fact from an invented
+one. Every summary therefore has a **fixed slot structure**, validated before
+any state changes:
+
+```
+## 当前任务        - 正在做的事 证据: <定位>
+## 已完成          - 动作/结论 证据: <定位>
+## 未完成          - 下一步具体动作 证据: <定位>
+## 约束            - 用户要求/不变量 证据: <定位>
+## 文件与命令      - 关键路径/命令 证据: <定位>
+## 在跑作业与句柄  - 作业/子代理/端口 证据: <定位>
+```
+
+- Slots appear once each, in that order; a slot with nothing to report is a
+  single `- 无`; `当前任务` may never be `无`.
+- Every fact is a `- ` bullet ending in `证据: <定位>` — an externalized
+  pointer (path, `file:line`, session id, tool name, command), **not** pasted
+  content. Facts are capped at 600 characters so summaries stay pointers
+  rather than copies.
+- `session_start` + `force: true` gets the **strict tier**: `已完成` and
+  `未完成` must carry real content and every evidence pointer must be a real
+  locator. That cost is deliberate — the more a summary throws away, the more
+  it must prove.
 
 ## How it works
 
