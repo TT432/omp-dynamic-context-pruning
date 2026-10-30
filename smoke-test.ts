@@ -28,7 +28,7 @@ import {
   resolveSessionId,
   type HandlerDeps,
 } from "./src/hooks";
-import { estimateContextTokens, maybeAppendReminder, REMIND_MARKER, UNIT_MARKER, BUDGET_MARKER, parseRemindPolicy, DEFAULT_TOKEN_THRESHOLD, DEFAULT_TOOLCALL_BUDGET, toolCallsSinceLastCompress, countToolCalls, finishedTodoSet } from "./src/remind";
+import { estimateContextTokens, maybeAppendReminder, REMIND_MARKER, UNIT_MARKER, BUDGET_MARKER, parseRemindPolicy, DEFAULT_TOKEN_THRESHOLD, DEFAULT_TOOLCALL_BUDGET, toolCallsSinceLastCompress, countToolCalls, tokenBracket, finishedTodoSet } from "./src/remind";
 import { Logger } from "./src/logger";
 import type { AgentMessage, ExtensionAPI, ExtensionContext, SessionEntry, ToolDefinition, ToolResult } from "./src/omp";
 
@@ -1077,6 +1077,37 @@ const compressTool = createCompressTool({
   const firedText = firstText(fired[fired.length - 1]);
   assert(fired.length === many.length + 1 && firedText.includes(BUDGET_MARKER), "budget fires only after 40 calls past the watermark");
   assert(firedText.includes("force=true"), "a full-session wipe is called out instead of offered as a peer anchor");
+}
+
+// ---------------------------------------------------------------------------
+// 19. the token reminder is bracketed: one report per 10% of the window above
+//     the threshold, not one per request while the same context sits there.
+// ---------------------------------------------------------------------------
+{
+  const at = (tokens: number): AgentMessage[] => [
+    { role: "assistant", content: [txt("turn")], usage: { input: tokens, output: 0, totalTokens: tokens } },
+  ];
+  const ctxAt = (tokens: number): ExtensionContext => ({ ...makeCtx(at(tokens)), model: { id: "m", contextWindow: 1000 } });
+  const policy = { tokenThreshold: 0.4, toolCallBudget: 0 };
+  const cursor = { remindLevel: 0 };
+  const fire = (tokens: number): boolean => {
+    const m = at(tokens);
+    return maybeAppendReminder(m, ctxAt(tokens), policy, 0, 0, cursor).length === m.length + 1;
+  };
+
+  assert(fire(410), "first crossing of the threshold reports");
+  assert(cursor.remindLevel === 4, "bracket recorded as 4 (40%)");
+  assert(!fire(420), "same 10% bracket stays silent");
+  assert(!fire(499), "still the same bracket at 49%");
+  assert(fire(510), "the next bracket reports once");
+  assert(cursor.remindLevel === 5, "bracket advanced to 5");
+  assert(!fire(390), "under the threshold nothing reports");
+  assert(cursor.remindLevel === 0, "bracket resets under the threshold");
+  assert(fire(410), "crossing again after the reset reports again");
+
+  assert(maybeAppendReminder(at(420), ctxAt(420), policy).length === 2, "without a cursor the reminder keeps its stateless behaviour");
+  assert(tokenBracket(423255, 400000, 1000000) === 4, "bracket steps on 10% of the window");
+  assert(tokenBracket(423255, 400000, undefined) === 10, "absolute mode steps on 10% of the budget");
 }
 
 console.log(failures === 0 ? "\nALL OK" : `\n${failures} FAILURE(S)`);

@@ -225,28 +225,52 @@ function anchorList(messages: AgentMessage[]): string {
  * Append at most one reminder to the LLM-facing message copy. Returns the
  * input array unchanged (same reference) when no reminder is warranted.
  */
+/** Mutable cursor holding the highest bracket already reported. */
+export interface RemindCursor {
+  remindLevel: number;
+}
+
+/** Above the threshold, one reminder per further 10% of the budget. */
+const REMIND_STEP_PERCENT = 10;
+
+/**
+ * Bracket index for the current estimate: 10% of the context window per step
+ * (absolute thresholds step on 10% of the budget, since no window is known).
+ */
+export function tokenBracket(tokens: number, budget: number, window: number | undefined): number {
+  const base = window !== undefined && window > 0 ? window : budget;
+  return Math.floor((tokens / base) * (100 / REMIND_STEP_PERCENT));
+}
+
 export function maybeAppendReminder(
   messages: AgentMessage[],
   ctx: ExtensionContext,
   policy: RemindPolicy,
   mark = 0,
   staleUsage = 0,
+  cursor?: RemindCursor,
 ): AgentMessage[] {
   if (messages.length === 0) return messages;
 
   const budget = remindBudget(policy.tokenThreshold, ctx);
   if (budget !== undefined) {
     const tokens = estimateContextTokens(messages, staleUsage);
-    if (tokens >= budget) {
+    if (tokens < budget) {
+      if (cursor !== undefined) cursor.remindLevel = 0; // back under the threshold
+    } else {
       const window = resolveContextWindow(ctx);
-      const pct = window ? ` (${Math.round((tokens / window) * 100)}% of the ${window}-token window)` : "";
-      return append(
-        messages,
-        `${REMIND_MARKER} Context is at ~${tokens} tokens${pct}. Compress NOW: ` +
-          `call compress with startAnchor one of ${anchorList(messages) || '"your own anchor"'} and a complete technical ` +
-          `summary of everything since that anchor. Finish the compress before starting any new work. ` +
-          `${FULL_SESSION_HINT}`,
-      );
+      const level = tokenBracket(tokens, budget, window);
+      if (cursor === undefined || level > cursor.remindLevel) {
+        if (cursor !== undefined) cursor.remindLevel = level;
+        const pct = window ? ` (${Math.round((tokens / window) * 100)}% of the ${window}-token window)` : "";
+        return append(
+          messages,
+          `${REMIND_MARKER} Context is at ~${tokens} tokens${pct}. Compress NOW: ` +
+            `call compress with startAnchor one of ${anchorList(messages) || '"your own anchor"'} and a complete technical ` +
+            `summary of everything since that anchor. Finish the compress before starting any new work. ` +
+            `${FULL_SESSION_HINT}`,
+        );
+      }
     }
   }
 

@@ -54,6 +54,13 @@ export interface SessionState {
    * fires the token reminder for a context that was just pruned.
    */
   usageMark: number;
+  /**
+   * Highest 10%-of-window bracket already reported by `[dcp:context]`. The
+   * reminder is stateless without it: every request re-estimates and fires
+   * again while the same context sits above the threshold, which reads as
+   * spam. Reset to 0 once the estimate drops back under the threshold.
+   */
+  remindLevel: number;
   /** Durable divergence from the last persisted dcp-state entry. */
   dirty: boolean;
 }
@@ -66,6 +73,7 @@ export function createSessionState(): SessionState {
     lastCompaction: 0,
     toolCallMark: 0,
     usageMark: 0,
+    remindLevel: 0,
     dirty: false,
   };
 }
@@ -78,6 +86,7 @@ export function resetForSession(state: SessionState, sessionId: string): void {
   state.lastCompaction = 0;
   state.toolCallMark = 0;
   state.usageMark = 0;
+  state.remindLevel = 0;
   state.dirty = false;
 }
 
@@ -88,6 +97,7 @@ interface SerializedState {
   blocks: CompressionBlock[];
   toolCallMark: number;
   usageMark: number;
+  remindLevel: number;
 }
 
 export function saveSessionState(pi: ExtensionAPI, state: SessionState): void {
@@ -99,6 +109,7 @@ export function saveSessionState(pi: ExtensionAPI, state: SessionState): void {
       blocks: state.blocks,
       toolCallMark: state.toolCallMark,
       usageMark: state.usageMark,
+      remindLevel: state.remindLevel,
     };
     const result = pi.appendEntry(PERSIST_TYPE, data);
     state.dirty = false;
@@ -153,6 +164,8 @@ export function loadSessionState(entries: SessionEntry[], state: SessionState): 
   state.toolCallMark =
     "toolCallMark" in data && typeof data.toolCallMark === "number" && data.toolCallMark >= 0 ? data.toolCallMark : 0;
   state.usageMark = "usageMark" in data && typeof data.usageMark === "number" && data.usageMark >= 0 ? data.usageMark : 0;
+  state.remindLevel =
+    "remindLevel" in data && typeof data.remindLevel === "number" && data.remindLevel >= 0 ? data.remindLevel : 0;
   state.dirty = false;
   return true;
 }
