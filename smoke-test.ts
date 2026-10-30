@@ -1057,9 +1057,17 @@ const compressTool = createCompressTool({
 {
   const st = createSessionState();
   const tool = createCompressTool({ state: st, logger, zod: zodStub, persist: () => {} });
-  const msgs = convo().slice(0, 9); // no compress call anywhere in the stream
+  // usage 900 describes the pre-compression context — exactly the report that
+  // must stop anchoring the estimate afterwards
+  const turn: AgentMessage = { role: "assistant", content: [txt("turn done")], usage: { input: 900, output: 0, totalTokens: 900 } };
+  const msgs = [...convo().slice(0, 9), turn]; // no compress call anywhere in the stream
   await tool.execute("tu_wm", { startAnchor: "a1", summary: sum("watermark") }, undefined, undefined, makeCtx(msgs));
   assert(st.toolCallMark === countToolCalls(msgs), "compress records the watermark from the live tool-call count");
+  assert(st.usageMark === 900, "compress records the pre-compression usage report as stale");
+  assert(estimateContextTokens(msgs, 900) < 900, "stale usage falls back to the character estimate");
+  const win = { ...makeCtx(msgs), model: { id: "m", contextWindow: 1000 } };
+  assert(maybeAppendReminder(msgs, win, tok(0.8), 0, 900) === msgs, "no token reminder from a stale usage report");
+  assert(maybeAppendReminder(msgs, win, tok(0.8), 0, 0).length === msgs.length + 1, "control: without the mark the same usage still fires");
 
   const policy = { tokenThreshold: 0, toolCallBudget: 40 };
   assert(maybeAppendReminder(msgs, makeCtx(msgs), policy, st.toolCallMark) === msgs, "no budget reminder right after a compression");

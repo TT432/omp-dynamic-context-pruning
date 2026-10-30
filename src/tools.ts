@@ -28,7 +28,7 @@ import {
 } from "./anchors";
 import { ADD_ANCHOR_PROMPT, COMPRESS_PROMPT } from "./prompts";
 import { validateInheritance, validateSummary } from "./summary";
-import { countToolCalls } from "./remind";
+import { countToolCalls, latestUsageTokens } from "./remind";
 
 // ---------------------------------------------------------------------------
 // shared helpers
@@ -240,6 +240,9 @@ export function createCompressTool(deps: CompressToolDeps): ToolDefinition {
       // (direct write, eval kernel, programmatic) passes through execute, so
       // the watermark can never be skipped the way a message scan was.
       state.toolCallMark = countToolCalls(messages);
+      // The newest usage report belongs to the pre-compression context; mark it
+      // so the next estimate does not anchor on the size we just discarded.
+      state.usageMark = latestUsageTokens(messages) ?? 0;
       state.dirty = true;
       persist();
 

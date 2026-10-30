@@ -113,16 +113,34 @@ function messageChars(message: AgentMessage): number {
   return n;
 }
 
+/** Provider-reported token total of the newest assistant message, if any. */
+export function latestUsageTokens(messages: AgentMessage[]): number | undefined {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i];
+    if (m.role !== "assistant") continue;
+    const anchored = usageTokens(m.usage);
+    if (anchored !== undefined) return anchored;
+  }
+  return undefined;
+}
+
 /**
- * Estimated tokens of the (already transformed) conversation. Exported for
- * tests.
+ * Estimated tokens of the (already transformed) conversation.
+ *
+ * `staleUsage` is the provider total recorded at the last compression. That
+ * report describes the *pre*-compression context, so anchoring on it makes the
+ * first request after every compression claim the old size and fire the token
+ * reminder for a context that was just pruned (observed: ~405k claimed on a
+ * context that had just been reduced to one summary). When the newest usage
+ * equals the stale mark, fall back to the character heuristic.
  */
-export function estimateContextTokens(messages: AgentMessage[]): number {
+export function estimateContextTokens(messages: AgentMessage[], staleUsage = 0): number {
   for (let i = messages.length - 1; i >= 0; i--) {
     const m = messages[i];
     if (m.role !== "assistant") continue;
     const anchored = usageTokens(m.usage);
     if (anchored === undefined) continue;
+    if (staleUsage > 0 && anchored === staleUsage) break;
     let tail = 0;
     for (let j = i + 1; j < messages.length; j++) tail += messageChars(messages[j]);
     return anchored + Math.ceil(tail / CHARS_PER_TOKEN);
@@ -212,12 +230,13 @@ export function maybeAppendReminder(
   ctx: ExtensionContext,
   policy: RemindPolicy,
   mark = 0,
+  staleUsage = 0,
 ): AgentMessage[] {
   if (messages.length === 0) return messages;
 
   const budget = remindBudget(policy.tokenThreshold, ctx);
   if (budget !== undefined) {
-    const tokens = estimateContextTokens(messages);
+    const tokens = estimateContextTokens(messages, staleUsage);
     if (tokens >= budget) {
       const window = resolveContextWindow(ctx);
       const pct = window ? ` (${Math.round((tokens / window) * 100)}% of the ${window}-token window)` : "";

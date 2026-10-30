@@ -153,7 +153,7 @@ export function createContextHandler(deps: HandlerDeps) {
 
     const messages = cloneMessages(event.messages ?? []);
     const transformed = applyCompressions(deps.state, deps.logger, messages);
-    const outgoing = maybeAppendReminder(transformed, ctx, deps.remind, deps.state.toolCallMark);
+    const outgoing = maybeAppendReminder(transformed, ctx, deps.remind, deps.state.toolCallMark, deps.state.usageMark);
     deps.logger.saveContext(deps.state.sessionId ?? "session", outgoing);
     return { messages: outgoing };
   };

@@ -46,6 +46,14 @@ export interface SessionState {
    * never resets.
    */
   toolCallMark: number;
+  /**
+   * Provider-reported token total at the moment of the last compression. That
+   * usage report describes the pre-compression context, so until the next
+   * request reports a fresh one the estimate must not anchor on it — otherwise
+   * the first request after every compression claims the old (huge) size and
+   * fires the token reminder for a context that was just pruned.
+   */
+  usageMark: number;
   /** Durable divergence from the last persisted dcp-state entry. */
   dirty: boolean;
 }
@@ -57,6 +65,7 @@ export function createSessionState(): SessionState {
     nextBlockId: 1,
     lastCompaction: 0,
     toolCallMark: 0,
+    usageMark: 0,
     dirty: false,
   };
 }
@@ -68,6 +77,7 @@ export function resetForSession(state: SessionState, sessionId: string): void {
   state.nextBlockId = 1;
   state.lastCompaction = 0;
   state.toolCallMark = 0;
+  state.usageMark = 0;
   state.dirty = false;
 }
 
@@ -77,6 +87,7 @@ interface SerializedState {
   nextBlockId: number;
   blocks: CompressionBlock[];
   toolCallMark: number;
+  usageMark: number;
 }
 
 export function saveSessionState(pi: ExtensionAPI, state: SessionState): void {
@@ -87,6 +98,7 @@ export function saveSessionState(pi: ExtensionAPI, state: SessionState): void {
       nextBlockId: state.nextBlockId,
       blocks: state.blocks,
       toolCallMark: state.toolCallMark,
+      usageMark: state.usageMark,
     };
     const result = pi.appendEntry(PERSIST_TYPE, data);
     state.dirty = false;
@@ -140,6 +152,7 @@ export function loadSessionState(entries: SessionEntry[], state: SessionState): 
       : maxId + 1;
   state.toolCallMark =
     "toolCallMark" in data && typeof data.toolCallMark === "number" && data.toolCallMark >= 0 ? data.toolCallMark : 0;
+  state.usageMark = "usageMark" in data && typeof data.usageMark === "number" && data.usageMark >= 0 ? data.usageMark : 0;
   state.dirty = false;
   return true;
 }
