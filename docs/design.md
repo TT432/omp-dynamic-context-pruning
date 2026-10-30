@@ -162,6 +162,35 @@ full-session compression — it discards the most and therefore must prove the
 most. Tier 1 stays cheap (a vague pointer is tolerated) so ordinary
 compressions do not lose their main benefit.
 
+### Baseline inheritance (absorbing a prior block)
+
+Slots constrain the *shape* of a summary, not its *content*, and a compress
+that absorbs a block deletes the only copy of what that block recorded. Slot
+structure alone does not stop the loss: session 01a18dc1 (2026-10-30) had
+three well-formed blocks, and the third replaced the second's finished
+implementation record with an analysis-only summary — the next turn then
+re-proposed work that was already done and committed.
+
+`compress` therefore runs `validateInheritance` before mutating state whenever
+the span contains prior blocks:
+
+- Every locator recorded in the absorbed blocks' `已完成` / `约束` /
+  `文件与命令` slots must still appear somewhere in the new summary. Locators
+  are backticked identifiers, file paths and CONSTANT forms — the things a
+  later turn can re-find in the repository.
+- Moving slots and merging bullets is fine; the check is on locators, not on
+  wording or position.
+- An obsolete fact stays valid if its bullet keeps the locator and says
+  `已废弃: <原因>`.
+- Prose facts without a locator are not checked, and blocks written before the
+  schema (unparseable) are skipped — history never blocks a compression.
+- A rejection lists the missing locators and leaves state untouched (INV-4).
+
+The check is deliberately mechanical: it fails a compress for dropping a
+pointer, and the model is expected to merge rather than rewrite. Verified
+against the real regression pair (blocks 2 → 3 of 01a18dc1): the old summary
+is refused with 14 missing locators listed.
+
 ## Modules
 
 ```
@@ -206,8 +235,28 @@ that is never persisted:
 | `[dcp:budget]` | N tool calls have run since the last compress | `DCP_REMIND_TOOLCALLS` (default 40, <=0 = off) |
 
 At most one reminder is appended per request; priority is
-`[dcp:context]` > `[dcp:unit]` > `[dcp:budget]`. Because the counters are
-computed after the transform, a compress resets them and the reminders stop.
+`[dcp:context]` > `[dcp:unit]` > `[dcp:budget]`.
+`[dcp:context]` and `[dcp:unit]` recompute from scratch on the transformed
+copy, so a compression silences them naturally.
+
+`[dcp:budget]` is measured against `SessionState.toolCallMark`, a durable
+watermark that `compress.execute` writes (`countToolCalls(messages)` at the
+moment of compression). The earlier implementation scanned the message stream
+for the newest compress call instead, which silently missed every compression
+issued through a channel that leaves no `write({path:"xd://compress"})` block —
+the eval kernel (`await tool.write(...)`), subagent-internal calls, or any
+programmatic caller. Live session 01a18dc1 hit this: a compression at 17:57:31
+succeeded and persisted its block, yet the stream still showed the last visible
+compress at 17:51:23, so every later request reported a budget overrun that had
+already been paid (60, then 85, growing). Because `execute` runs for every
+caller path, the watermark cannot be skipped; it rides `dcp-state` and resets
+when a compaction clears the blocks.
+
+The reminder text lists named anchors as peers and calls `session_start` out
+separately — a full-session wipe needs `force=true`, the strict summary tier,
+and must merge every locator of the block it absorbs. Offering it inside
+"startAnchor one of ..." made the reminder recommend a call that fails
+validation.
 
 Estimate: newest assistant usage report anchors the total, tail counted at
 ~4 chars/token (see `estimateContextTokens`). Known limitation: right after a

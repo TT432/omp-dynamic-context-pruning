@@ -57,9 +57,15 @@ export interface RemindPolicy {
 }
 
 const CHARS_PER_TOKEN = 4;
-const XD_WRITE_TOOL = "write";
-const XD_COMPRESS_PATH = "xd://compress";
-const COMPRESS_TOOL = "compress";
+
+/**
+ * `session_start` is not a peer of the named anchors: it wipes everything and
+ * therefore demands force + the strict tier. Listing it inside "startAnchor one
+ * of ..." made the reminder recommend a call that fails validation, so it is
+ * called out separately.
+ */
+const FULL_SESSION_HINT =
+  'Do not reach for "session_start" as a shortcut: a full-session wipe needs force=true, the strict summary tier, and must merge every locator of the block it absorbs.';
 
 function num(raw: string | undefined, fallback: number): number {
   const trimmed = (raw ?? "").trim();
@@ -143,41 +149,30 @@ export function remindBudget(threshold: number, ctx: ExtensionContext): number |
   return window === undefined ? undefined : Math.floor(window * threshold);
 }
 
-/** True when the block is a compress call, direct or inside the xd://write envelope. */
-function isCompressCall(block: ContentBlock): boolean {
-  if (!isToolCallBlock(block)) return false;
-  if (block.name === COMPRESS_TOOL) return true;
-  if (block.name !== XD_WRITE_TOOL) return false;
-  const path = block.arguments.path;
-  return typeof path === "string" && path.trim() === XD_COMPRESS_PATH;
+/** Total tool calls in the (transformed) conversation. */
+export function countToolCalls(messages: AgentMessage[]): number {
+  let count = 0;
+  for (const message of messages) {
+    const content = message.content;
+    if (!Array.isArray(content)) continue;
+    for (const block of content) if (isToolCallBlock(block)) count++;
+  }
+  return count;
 }
 
 /**
- * Tool calls issued since the last compress call in this (transformed) copy.
- * Compressed spans are already collapsed, so this counts live work only.
+ * Tool calls issued since the last compression, measured against the durable
+ * watermark instead of a scan for a compress call.
+ *
+ * The scan was wrong whenever the compress went through a channel that leaves
+ * no `write({path:"xd://compress"})` block — notably the eval kernel
+ * (`await tool.write(...)`) and any programmatic caller. The compression still
+ * ran and still replaced the context, but the counter kept growing, so every
+ * later request claimed a budget overrun. The watermark is written by
+ * `compress.execute` itself, so every path is accounted for.
  */
-export function toolCallsSinceLastCompress(messages: AgentMessage[]): number {
-  let lastCompress = -1;
-  const positions: { msg: number; block: number }[] = [];
-  for (let i = 0; i < messages.length; i++) {
-    const content = messages[i].content;
-    if (!Array.isArray(content)) continue;
-    for (let j = 0; j < content.length; j++) {
-      if (isCompressCall(content[j])) lastCompress = positions.push({ msg: i, block: j }) - 1;
-    }
-  }
-  const after = lastCompress === -1 ? { msg: -1, block: -1 } : positions[lastCompress];
-  let count = 0;
-  for (let i = 0; i < messages.length; i++) {
-    const content = messages[i].content;
-    if (!Array.isArray(content)) continue;
-    for (let j = 0; j < content.length; j++) {
-      if (!isToolCallBlock(content[j])) continue;
-      if (i < after.msg || (i === after.msg && j <= after.block)) continue;
-      count++;
-    }
-  }
-  return count;
+export function toolCallsSinceLastCompress(messages: AgentMessage[], mark = 0): number {
+  return Math.max(0, countToolCalls(messages) - mark);
 }
 
 /**
@@ -216,6 +211,7 @@ export function maybeAppendReminder(
   messages: AgentMessage[],
   ctx: ExtensionContext,
   policy: RemindPolicy,
+  mark = 0,
 ): AgentMessage[] {
   if (messages.length === 0) return messages;
 
@@ -228,8 +224,9 @@ export function maybeAppendReminder(
       return append(
         messages,
         `${REMIND_MARKER} Context is at ~${tokens} tokens${pct}. Compress NOW: ` +
-          `call compress with startAnchor one of ${anchorList(messages) || '"session_start"'} and a complete technical ` +
-          `summary of everything since that anchor. Finish the compress before starting any new work.`,
+          `call compress with startAnchor one of ${anchorList(messages) || '"your own anchor"'} and a complete technical ` +
+          `summary of everything since that anchor. Finish the compress before starting any new work. ` +
+          `${FULL_SESSION_HINT}`,
       );
     }
   }
@@ -239,19 +236,20 @@ export function maybeAppendReminder(
       messages,
       `${UNIT_MARKER} The todo set just completed — that is a work-unit boundary. ` +
         `Place an anchor at the start of the next unit, then compress the finished one: ` +
-        `compress with startAnchor one of ${anchorList(messages) || '"session_start"'}, and make the summary state ` +
-        `当前任务 / 刚完成的动作 / 下一步具体动作.`,
+        `compress with startAnchor one of ${anchorList(messages) || '"your own anchor"'}, and make the summary state ` +
+        `当前任务 / 刚完成的动作 / 下一步具体动作. ${FULL_SESSION_HINT}`,
     );
   }
 
   if (policy.toolCallBudget > 0) {
-    const used = toolCallsSinceLastCompress(messages);
+    const used = toolCallsSinceLastCompress(messages, mark);
     if (used >= policy.toolCallBudget) {
       return append(
         messages,
         `${BUDGET_MARKER} ${used} tool calls have run since the last compress (budget ${policy.toolCallBudget}). ` +
           `If this stretch has converged, place an anchor and compress it now (startAnchor one of ` +
-          `${anchorList(messages) || '"session_start"'}); if it has not, keep working — this reminder repeats until you compress.`,
+          `${anchorList(messages) || '"your own anchor"'}); if it has not, keep working — this reminder repeats until you compress. ` +
+          `${FULL_SESSION_HINT}`,
       );
     }
   }

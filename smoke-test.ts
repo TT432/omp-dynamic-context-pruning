@@ -28,7 +28,7 @@ import {
   resolveSessionId,
   type HandlerDeps,
 } from "./src/hooks";
-import { estimateContextTokens, maybeAppendReminder, REMIND_MARKER, UNIT_MARKER, BUDGET_MARKER, parseRemindPolicy, DEFAULT_TOKEN_THRESHOLD, DEFAULT_TOOLCALL_BUDGET, toolCallsSinceLastCompress, finishedTodoSet } from "./src/remind";
+import { estimateContextTokens, maybeAppendReminder, REMIND_MARKER, UNIT_MARKER, BUDGET_MARKER, parseRemindPolicy, DEFAULT_TOKEN_THRESHOLD, DEFAULT_TOOLCALL_BUDGET, toolCallsSinceLastCompress, countToolCalls, finishedTodoSet } from "./src/remind";
 import { Logger } from "./src/logger";
 import type { AgentMessage, ExtensionAPI, ExtensionContext, SessionEntry, ToolDefinition, ToolResult } from "./src/omp";
 
@@ -504,6 +504,7 @@ const compressTool = createCompressTool({
     createdAt: 123,
   });
   s5.nextBlockId = 8;
+  s5.toolCallMark = 42;
   s5.dirty = true;
   const app: { customType: string; data: unknown }[] = [];
   saveSessionState(makePi(app), s5);
@@ -516,6 +517,7 @@ const compressTool = createCompressTool({
   const loaded = loadSessionState(branch, s6);
   assert(loaded && s6.blocks.length === 1 && s6.blocks[0].id === 7 && s6.blocks[0].compressCallId === "tu_c", "round trip restores the block");
   assert(s6.nextBlockId === 8, "nextBlockId restored");
+  assert(s6.toolCallMark === 42, "toolCallMark restored from the durable state");
 
   for (const v of [1, 2, 3]) {
     const oldBranch: SessionEntry[] = [
@@ -817,7 +819,9 @@ const compressTool = createCompressTool({
     { role: "assistant", content: Array.from({ length: n }, (_, i) => tu(`c${i}`, "bash", { command: "x" })) },
   ];
   assert(toolCallsSinceLastCompress(calls(39)) === 39, "counts tool calls since the start");
-  assert(toolCallsSinceLastCompress(convo()) === 0, "a compress call resets the count");
+  assert(countToolCalls(convo()) === 5, "countToolCalls counts every toolCall block in the stream");
+  assert(toolCallsSinceLastCompress(convo(), countToolCalls(convo())) === 0, "watermark resets the count");
+  assert(toolCallsSinceLastCompress(convo(), countToolCalls(convo()) + 10) === 0, "a watermark ahead of the stream never goes negative");
   const under = calls(39);
   assert(maybeAppendReminder(under, ctx0, budgetPolicy) === under, "no budget reminder under the budget");
   const at = calls(40);
@@ -911,6 +915,160 @@ const compressTool = createCompressTool({
     );
     assert(st.blocks.length === 0, `INV-4: strict ${label} leaves state untouched`);
   }
+}
+
+// ---------------------------------------------------------------------------
+// 17. baseline inheritance — a compress that absorbs a prior block must carry
+//     that block's locatable facts, or say they are superseded. This is the
+//     failure that made session 01a18dc1 re-propose already-committed work.
+// ---------------------------------------------------------------------------
+{
+  const slotSummary = (bodies: Record<string, string>): string =>
+    SLOTS.map((slot) => `## ${slot}\n- ${bodies[slot] ?? "无"}`).join("\n");
+
+  const OLD = slotSummary({
+    当前任务: "旧工作单元 证据: src/legacy.ts:1",
+    已完成: "新增 src/legacy.ts 导出 证据: src/legacy.ts:12",
+    约束: "不得改动 `INV-4` 语义 证据: docs/design.md:64",
+  });
+
+  /** Prior block (a1 → tu_c1) is fully contained in the new span (tu_c2). */
+  const harness = (oldSummary = OLD) => {
+    const st = createSessionState();
+    st.blocks.push({
+      id: 2,
+      startName: "a1",
+      startToolCallId: "tu_a1",
+      summary: oldSummary,
+      compressCallId: "tu_c1",
+      createdAt: 1,
+    });
+    st.nextBlockId = 3;
+    const tool = createCompressTool({ state: st, logger, zod: zodStub, persist: () => {} });
+    const msgs: AgentMessage[] = [
+      { role: "user", content: [txt("p")] },
+      { role: "assistant", content: [anchorCall("tu_a1", "a1")] },
+      tres("tu_a1", "add_anchor", "1"),
+      { role: "assistant", content: [txt("work"), tu("tu_m1", "bash", { command: "ls" })] },
+      tres("tu_m1", "bash", "files"),
+      { role: "assistant", content: [tu("tu_c1", "compress", { startAnchor: "a1", summary: oldSummary })] },
+      tres("tu_c1", "compress", "ok"),
+      { role: "assistant", content: [txt("more")] },
+      { role: "assistant", content: [tu("tu_c2", "compress", { startAnchor: "session_start", summary: "new" })] },
+      tres("tu_c2", "compress", "ok"),
+    ];
+    return { st, tool, ctx: makeCtx(msgs) };
+  };
+
+  /** Strict-tier summary that carries every locator of OLD unless overridden. */
+  const carried = (overrides: Record<string, string> = {}): string =>
+    slotSummary({
+      当前任务: "接着旧工作单元 证据: src/legacy.ts:1",
+      已完成: "旧导出保留 证据: src/legacy.ts:12",
+      未完成: "跑测试 证据: smoke-test.ts:1",
+      约束: "不得改动 `INV-4` 语义 证据: docs/design.md:64",
+      ...overrides,
+    });
+
+  // inheritance satisfied → absorbed
+  {
+    const { st, tool, ctx } = harness();
+    const next = carried();
+    const res = await tool.execute("tu_c2", { startAnchor: "session_start", summary: next, force: true }, undefined, undefined, ctx);
+    assert(st.blocks.length === 1 && st.blocks[0].summary === next, "absorbing summary that carries the old locators is accepted");
+    assert(textOf(res).includes("Absorbed 1 prior compression"), "absorption of an inherited block is reported");
+  }
+
+  // a dropped constraint key is refused, and nothing mutates
+  {
+    const { st, tool, ctx } = harness();
+    await assertThrows(
+      () => tool.execute("tu_c2", { startAnchor: "session_start", summary: carried({ 约束: "无" }), force: true }, undefined, undefined, ctx),
+      /基线继承[\s\S]*inv-4/,
+      "absorbing summary that drops a constraint locator is refused",
+    );
+    assert(st.blocks.length === 1 && st.blocks[0].summary === OLD && st.nextBlockId === 3, "INV-4: inheritance rejection leaves state untouched");
+  }
+
+  // a dropped completed-work locator is refused even when the rest is detailed
+  {
+    const { st, tool, ctx } = harness();
+    await assertThrows(
+      () =>
+        tool.execute(
+          "tu_c2",
+          {
+            startAnchor: "session_start",
+            summary: carried({ 当前任务: "继续 证据: smoke-test.ts:1", 已完成: "全部测试通过 证据: smoke-test.ts:9" }),
+            force: true,
+          },
+          undefined,
+          undefined,
+          ctx,
+        ),
+      /src\/legacy\.ts/,
+      "absorbing summary that drops a completed-work locator is refused",
+    );
+    assert(st.blocks.length === 1 && st.blocks[0].summary === OLD, "refused absorption records no new block");
+  }
+
+  // explicit supersede keeps the locator and passes
+  {
+    const { st, tool, ctx } = harness();
+    const next = slotSummary({
+      当前任务: "改用新模块 证据: src/legacy.ts:1",
+      已完成: "旧导出已废弃：改由 src/new.ts 提供 证据: src/legacy.ts:12",
+      未完成: "补测试 证据: smoke-test.ts:1",
+      约束: "不得改动 `INV-4` 语义 证据: docs/design.md:64",
+    });
+    await tool.execute("tu_c2", { startAnchor: "session_start", summary: next, force: true }, undefined, undefined, ctx);
+    assert(st.blocks.length === 1 && st.blocks[0].summary === next, "explicitly superseded fact (with its locator) is accepted");
+  }
+
+  // locator matching ignores slot moves, case and separators
+  {
+    const { st, tool, ctx } = harness(slotSummary({ 当前任务: "旧 证据: a.ts:1", 已完成: "改 src\\legacy.ts 的导出 证据: a.ts:2" }));
+    const next = carried({ 约束: "无", 已完成: "见 SRC/Legacy.ts 证据: smoke-test.ts:1" });
+    await tool.execute("tu_c2", { startAnchor: "session_start", summary: next, force: true }, undefined, undefined, ctx);
+    assert(st.blocks.length === 1 && st.blocks[0].summary === next, "locator survives slot move, case change and separator change");
+  }
+
+  // facts without a locator are not checked, and pre-schema blocks never block
+  {
+    const plain = slotSummary({ 当前任务: "旧 证据: a.ts:1", 已完成: "修好了渲染 证据: a.ts:2" });
+    const { st, tool, ctx } = harness(plain);
+    await tool.execute("tu_c2", { startAnchor: "session_start", summary: carried({ 约束: "无" }), force: true }, undefined, undefined, ctx);
+    assert(st.blocks.length === 1 && st.blocks[0].summary !== plain, "fact without a locator is not required to survive");
+  }
+  {
+    const freeForm = "历史自由文本：改过 src/legacy.ts，细节见旧日志";
+    const { st, tool, ctx } = harness(freeForm);
+    await tool.execute("tu_c2", { startAnchor: "session_start", summary: carried({ 约束: "无" }), force: true }, undefined, undefined, ctx);
+    assert(st.blocks.length === 1 && st.blocks[0].summary !== freeForm, "pre-schema block is skipped instead of blocking the compress");
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 18. budget cost resets from the durable watermark, including a compress that
+//     leaves no compress call in the message stream (eval kernel:
+//     await tool.write({path:"xd://compress"})). Live session 01a18dc1 claimed
+//     "60 tool calls since the last compress" right after a successful one.
+// ---------------------------------------------------------------------------
+{
+  const st = createSessionState();
+  const tool = createCompressTool({ state: st, logger, zod: zodStub, persist: () => {} });
+  const msgs = convo().slice(0, 9); // no compress call anywhere in the stream
+  await tool.execute("tu_wm", { startAnchor: "a1", summary: sum("watermark") }, undefined, undefined, makeCtx(msgs));
+  assert(st.toolCallMark === countToolCalls(msgs), "compress records the watermark from the live tool-call count");
+
+  const policy = { tokenThreshold: 0, toolCallBudget: 40 };
+  assert(maybeAppendReminder(msgs, makeCtx(msgs), policy, st.toolCallMark) === msgs, "no budget reminder right after a compression");
+
+  const many = [...msgs, { role: "assistant", content: Array.from({ length: 40 }, (_, i) => tu(`wm${i}`, "bash", { command: "x" })) }];
+  const fired = maybeAppendReminder(many, makeCtx(many), policy, st.toolCallMark);
+  const firedText = firstText(fired[fired.length - 1]);
+  assert(fired.length === many.length + 1 && firedText.includes(BUDGET_MARKER), "budget fires only after 40 calls past the watermark");
+  assert(firedText.includes("force=true"), "a full-session wipe is called out instead of offered as a peer anchor");
 }
 
 console.log(failures === 0 ? "\nALL OK" : `\n${failures} FAILURE(S)`);

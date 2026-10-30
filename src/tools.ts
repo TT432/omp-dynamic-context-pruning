@@ -27,7 +27,8 @@ import {
   type AnchorRef,
 } from "./anchors";
 import { ADD_ANCHOR_PROMPT, COMPRESS_PROMPT } from "./prompts";
-import { validateSummary } from "./summary";
+import { validateInheritance, validateSummary } from "./summary";
+import { countToolCalls } from "./remind";
 
 // ---------------------------------------------------------------------------
 // shared helpers
@@ -128,7 +129,7 @@ export function createCompressTool(deps: CompressToolDeps): ToolDefinition {
   const { state, logger, zod, persist } = deps;
   const parameters = zod.object({
     startAnchor: zod.string({ description: "Anchor where compression starts (consumed); \"session_start\" compresses from the original prompt" }),
-    summary: zod.string({ description: "Slot-structured summary replacing everything from the anchor up to this compress call; the only record future turns will have. Required slot headers: ## 当前任务 / ## 已完成 / ## 未完成 / ## 约束 / ## 文件与命令 / ## 在跑作业与句柄, in that order; every fact is a `- ` bullet ending in `证据: <locator>`, an empty slot is `- 无`" }),
+    summary: zod.string({ description: "Slot-structured summary replacing everything from the anchor up to this compress call; the only record future turns will have. Required slot headers: ## 当前任务 / ## 已完成 / ## 未完成 / ## 约束 / ## 文件与命令 / ## 在跑作业与句柄, in that order; every fact is a `- ` bullet ending in `证据: <locator>`, an empty slot is `- 无`. Absorbing a prior compression deletes it: every locator it recorded under 已完成 / 约束 / 文件与命令 must still appear in this summary (say 「已废弃: <原因>」 with the locator if obsolete) or the compress is rejected." }),
     force: zod.boolean({ description: 'Required (=true) when startAnchor is "session_start": full-session compression while work is in progress causes amnesia. Only confirm when the current work unit is complete. The summary must then pass the strict tier: 已完成 and 未完成 carry real content, and every 证据 must be a real locator (path, file:line, session id, URI or command).' }).optional(),
   });
 
@@ -160,7 +161,7 @@ export function createCompressTool(deps: CompressToolDeps): ToolDefinition {
 
       // Schema check runs before any branch scanning or state mutation (INV-4).
       // The strict tier applies to exactly the calls that discard everything.
-      validateSummary(summary, { full: startName === SESSION_START_ANCHOR });
+      const parsed = validateSummary(summary, { full: startName === SESSION_START_ANCHOR });
 
       const messages = branchMessages(ctx);
       if (messages.length === 0) {
@@ -214,6 +215,14 @@ export function createCompressTool(deps: CompressToolDeps): ToolDefinition {
         consumed.push(b); // fully contained — absorbed into the new summary
       }
 
+      // Absorbing a block deletes the only copy of its facts, so the new
+      // summary must carry them (or mark them superseded). Runs after the
+      // schema check and after span resolution, still before any mutation.
+      validateInheritance(
+        consumed.map((b) => ({ blockId: b.id, startName: b.startName, summary: b.summary })),
+        parsed,
+      );
+
       const block: CompressionBlock = {
         id: state.nextBlockId++,
         startName,
@@ -227,6 +236,10 @@ export function createCompressTool(deps: CompressToolDeps): ToolDefinition {
         state.blocks = state.blocks.filter((b) => !consumedIds.has(b.id));
       }
       state.blocks.push(block);
+      // The reminder budget is measured from here on: every caller path
+      // (direct write, eval kernel, programmatic) passes through execute, so
+      // the watermark can never be skipped the way a message scan was.
+      state.toolCallMark = countToolCalls(messages);
       state.dirty = true;
       persist();
 

@@ -170,3 +170,104 @@ export function validateSummary(text: string, options: ValidateSummaryOptions = 
   }
   return parsed;
 }
+
+// ---------------------------------------------------------------------------
+// baseline inheritance (absorbing a prior block must not drop its facts)
+// ---------------------------------------------------------------------------
+
+/**
+ * Slots whose facts outlive a compression. 当前任务 and 未完成 describe the live
+ * edge of the work and legitimately change; 已完成 / 约束 / 文件与命令 describe
+ * durable state and must never vanish silently when the block holding them is
+ * absorbed.
+ *
+ * Session 01a18dc1 lost a finished implementation exactly this way: block 2
+ * recorded it (files, verification), block 3 replaced block 2 with an
+ * analysis-only summary, and the following turn re-proposed work that was
+ * already done and committed. Slot structure alone does not prevent it —
+ * every block was well-formed; the content was replaced, not merged.
+ */
+export const INHERITED_SLOTS = ["已完成", "约束", "文件与命令"] as const;
+
+export type InheritedSlot = (typeof INHERITED_SLOTS)[number];
+
+/** A compression block that this compress call is about to consume. */
+export interface InheritedBlock {
+  blockId: number;
+  startName: string;
+  summary: string;
+}
+
+/**
+ * Locator-ish tokens inside a fact: backticked identifiers, file paths and
+ * CONSTANTS. Anything a later turn could re-find in the repository. Prose
+ * without a locator is not checkable, so it is not checked — the schema already
+ * asks facts to point at artifacts rather than paste them.
+ */
+const KEY_PATTERNS: RegExp[] = [
+  /`([^`\n]{2,120})`/g,
+  /[A-Za-z0-9_.\/\\-]+\.(?:ts|tsx|js|mjs|cjs|json|md|py|toml|ya?ml|txt)\b/g,
+  /\b[A-Z][A-Z0-9]*(?:[-_][A-Z0-9]+)+\b/g,
+];
+
+/** A superseded fact must say so in its own bullet. */
+const DISCARD_MARK = "废弃";
+
+function normalizeKey(key: string): string {
+  return key.trim().replace(/\\/g, "/").toLowerCase();
+}
+
+/** Durable locators mentioned by one fact. */
+export function collectIdentityKeys(fact: string): string[] {
+  const out = new Set<string>();
+  for (const re of KEY_PATTERNS) {
+    re.lastIndex = 0;
+    for (let m = re.exec(fact); m !== null; m = re.exec(fact)) {
+      const key = normalizeKey(m[1] ?? m[0]);
+      if (key.length >= 2 && key.length <= 120) out.add(key);
+    }
+  }
+  return [...out];
+}
+
+/**
+ * Refuse a compression that absorbs prior blocks while dropping the locatable
+ * facts they recorded. A fact survives when its locator appears anywhere in the
+ * new summary — moving slots and merging bullets are fine, and a bullet that
+ * says the old fact is superseded naturally contains its locator.
+ *
+ * Blocks written before the slot schema cannot be parsed; they are skipped —
+ * history never blocks a compression.
+ */
+export function validateInheritance(previous: InheritedBlock[], next: ParsedSummary): void {
+  if (previous.length === 0) return;
+  const haystack = next.bullets.map((b) => normalizeKey(`${b.fact} ${b.evidence}`)).join("\n");
+  const problems: string[] = [];
+
+  for (const block of previous) {
+    let parsed: ParsedSummary;
+    try {
+      parsed = parseSummary(block.summary);
+    } catch {
+      continue; // pre-schema block — nothing structurally checkable
+    }
+    for (const slot of INHERITED_SLOTS) {
+      for (const bullet of parsed.bySlot.get(slot)!) {
+        if (bullet.fact === NONE) continue;
+        const uncovered = collectIdentityKeys(bullet.fact).filter((key) => !haystack.includes(key));
+        if (uncovered.length > 0) {
+          const snippet = bullet.fact.length > 60 ? `${bullet.fact.slice(0, 60)}…` : bullet.fact;
+          problems.push(`  - block ${block.blockId}「${block.startName}」/ ${slot}：「${snippet}」缺 ${uncovered.join(", ")}`);
+        }
+      }
+    }
+  }
+
+  if (problems.length === 0) return;
+  fail(
+    `本次压缩会吸收 ${previous.length} 个既有压缩块，但新摘要没有接住它们记录的事实（基线继承）。` +
+      `下列定位必须出现在新摘要中（可换槽位、可合并进其他条目；确已失效就在条目里写「${DISCARD_MARK}: <原因>」，同样要带上定位）：\n` +
+      `${problems.join("\n")}\n` +
+      `吸收旧块时摘要必须合并而不是重写。`,
+  );
+}

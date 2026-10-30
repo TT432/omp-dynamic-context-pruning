@@ -78,6 +78,12 @@ any state changes:
   `未完成` must carry real content and every evidence pointer must be a real
   locator. That cost is deliberate — the more a summary throws away, the more
   it must prove.
+- A compress that absorbs a prior block must **merge** it: every locator
+  (path, `file:line`, `` `identifier` ``, CONSTANT) that block recorded under
+  `已完成` / `约束` / `文件与命令` has to appear in the new summary. Keep the
+  locator and mark obsolete facts `已废弃: <原因>`; dropping one is rejected
+  with the missing locators listed, and nothing is compressed. Slot structure
+  alone does not prevent loss — the content is what must survive.
 
 ## How it works
 
@@ -133,12 +139,18 @@ Two further triggers fire without any token pressure:
   next unit plus a compress of the finished one.
 - `[dcp:budget]` — N tool calls have run since the last compress.
   `DCP_REMIND_TOOLCALLS` sets N (default `40`, observed unit size
-  ~36 calls/todo item in 20 sessions), `0` = disabled.
+  ~36 calls/todo item in 20 sessions), `0` = disabled. N is measured against
+  the durable watermark `compress` writes, not against a scan for a compress
+  call in the message stream: a compression issued through the eval kernel or
+  any programmatic caller leaves no `write({path:"xd://compress"})` block, and
+  the old scan therefore never reset (live: 60 → 85 claimed overruns after a
+  compression that had already happened).
 
 One reminder at most is appended per request, with priority
-token > unit > budget. All three stop once the span is compressed, because
-they are computed on the transformed message copy. The reminder only ever
-touches the outgoing message copy; session history is never modified.
+token > unit > budget. The token and unit triggers recompute on the
+transformed copy, so a compression silences them; the budget trigger resets
+because `compress` moved the watermark. The reminder only ever touches the
+outgoing message copy; session history is never modified.
 
 ## Verification
 

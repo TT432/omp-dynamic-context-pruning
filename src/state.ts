@@ -37,6 +37,15 @@ export interface SessionState {
   nextBlockId: number;
   /** Timestamp of the latest omp compaction entry seen; blocks die on compaction. */
   lastCompaction: number;
+  /**
+   * Total tool calls visible when the last compression was recorded. The
+   * reminder budget is measured against this watermark instead of scanning for
+   * a compress call in the message stream: calls issued through the eval
+   * kernel (`await tool.write({path:"xd://compress"})`) never appear as a
+   * `write` toolCall block, so a message scan misses them and the counter
+   * never resets.
+   */
+  toolCallMark: number;
   /** Durable divergence from the last persisted dcp-state entry. */
   dirty: boolean;
 }
@@ -47,6 +56,7 @@ export function createSessionState(): SessionState {
     blocks: [],
     nextBlockId: 1,
     lastCompaction: 0,
+    toolCallMark: 0,
     dirty: false,
   };
 }
@@ -57,6 +67,7 @@ export function resetForSession(state: SessionState, sessionId: string): void {
   state.blocks = [];
   state.nextBlockId = 1;
   state.lastCompaction = 0;
+  state.toolCallMark = 0;
   state.dirty = false;
 }
 
@@ -65,6 +76,7 @@ interface SerializedState {
   sessionId: string | null;
   nextBlockId: number;
   blocks: CompressionBlock[];
+  toolCallMark: number;
 }
 
 export function saveSessionState(pi: ExtensionAPI, state: SessionState): void {
@@ -74,6 +86,7 @@ export function saveSessionState(pi: ExtensionAPI, state: SessionState): void {
       sessionId: state.sessionId,
       nextBlockId: state.nextBlockId,
       blocks: state.blocks,
+      toolCallMark: state.toolCallMark,
     };
     const result = pi.appendEntry(PERSIST_TYPE, data);
     state.dirty = false;
@@ -125,6 +138,8 @@ export function loadSessionState(entries: SessionEntry[], state: SessionState): 
     "nextBlockId" in data && typeof data.nextBlockId === "number" && data.nextBlockId > maxId
       ? data.nextBlockId
       : maxId + 1;
+  state.toolCallMark =
+    "toolCallMark" in data && typeof data.toolCallMark === "number" && data.toolCallMark >= 0 ? data.toolCallMark : 0;
   state.dirty = false;
   return true;
 }
