@@ -57,9 +57,18 @@ export interface ValidateSummaryOptions {
 export const SUMMARY_TEMPLATE = `${SUMMARY_SLOTS.map((slot) => `## ${slot}\n- 事实 证据: <定位>`).join("\n")}`;
 
 const SLOT_LIST = SUMMARY_SLOTS.join(" / ");
-const EVIDENCE_RE = /^(.+)\s证据\s*[:：]\s*(\S.*)$/s;
+/**
+ * `证据: <locator>` terminator. The whitespace before the keyword is optional:
+ * a Chinese sentence ends with `。` and models write `…。证据: x.ts:12`, which is
+ * exactly as checkable as `… 证据: x.ts:12`. Requiring the space rejected
+ * well-formed bullets and only taught the model to rewrite evidence tokens
+ * (feedback fb_mvx4d0fn9o6n). `(.*)` is greedy so a fact containing the word
+ * 证据 earlier in the line still splits at the last terminator.
+ */
+const EVIDENCE_RE = /^(.*)\s*证据\s*[:：]\s*(\S.*)$/s;
 /** Locator shapes accepted at the strict tier: path, file:line, session id, URI, command. */
 const LOCATOR_RE = /[:#/\\@]/;
+const LOCATOR_HELP = "path / file:line / 会话 id / URI / 命令（例如 src/transform.ts:44、proc://bbdev、git log）";
 
 function fail(message: string): never {
   throw new Error(message);
@@ -115,7 +124,10 @@ export function parseSummary(text: string): ParsedSummary {
 
     const match = EVIDENCE_RE.exec(body);
     if (!match) {
-      fail(`${where}：每条事实都必须以「证据: <定位>」结尾（例如「- 改了 transform.ts:44 证据: src/transform.ts:44」）；没有可引用证据的内容不要写进摘要`);
+      fail(
+        `${where}：每条事实都必须以「证据: <定位>」结尾（例如「- 改了 transform.ts:44 证据: src/transform.ts:44」，` +
+          `「证据」前的空格可省，「:」可用全角「：」）；没有可引用证据的内容不要写进摘要`,
+      );
     }
     const fact = match[1].trim();
     const evidence = match[2].trim();
@@ -165,7 +177,10 @@ export function validateSummary(text: string, options: ValidateSummaryOptions = 
   for (const bullet of parsed.bullets) {
     if (bullet.fact === NONE) continue;
     if (!LOCATOR_RE.test(bullet.evidence)) {
-      fail(`force 全量压缩要求可核对的证据定位，「${bullet.slot}」条目「${bullet.fact.slice(0, 40)}」的证据「${bullet.evidence}」不含任何定位（需要 path、file:line、会话 id、URI 或命令）`);
+      fail(
+        `force 全量压缩要求可核对的证据定位，「${bullet.slot}」条目「${bullet.fact.slice(0, 40)}」的证据「${bullet.evidence}」不含任何定位。` +
+          `可接受的证据形式：${LOCATOR_HELP}；定位后面可以再跟中文说明（如「src/transform.ts:44（翻转轴面滑条）」）`,
+      );
     }
   }
   return parsed;

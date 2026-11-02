@@ -30,6 +30,7 @@ import {
 } from "./src/hooks";
 import { estimateContextTokens, maybeAppendReminder, REMIND_MARKER, UNIT_MARKER, BUDGET_MARKER, parseRemindPolicy, DEFAULT_TOKEN_THRESHOLD, DEFAULT_TOOLCALL_BUDGET, toolCallsSinceLastCompress, countToolCalls, tokenBracket, finishedTodoSet } from "./src/remind";
 import { Logger } from "./src/logger";
+import { parseSummary } from "./src/summary";
 import type { AgentMessage, ExtensionAPI, ExtensionContext, SessionEntry, ToolDefinition, ToolResult } from "./src/omp";
 
 const logger = new Logger(false);
@@ -1108,6 +1109,42 @@ const compressTool = createCompressTool({
   assert(maybeAppendReminder(at(420), ctxAt(420), policy).length === 2, "without a cursor the reminder keeps its stateless behaviour");
   assert(tokenBracket(423255, 400000, 1000000) === 4, "bracket steps on 10% of the window");
   assert(tokenBracket(423255, 400000, undefined) === 10, "absolute mode steps on 10% of the budget");
+}
+
+// ---------------------------------------------------------------------------
+// 20. the evidence terminator: `证据:` may directly follow the fact text (a
+//     Chinese sentence ends with 。) and anything after the locator is part of
+//     the evidence. Requiring whitespace rejected well-formed bullets and only
+//     taught the model to rewrite locators (feedback fb_mvx4d0fn9o6n).
+// ---------------------------------------------------------------------------
+{
+  const withEvidence = (bullet: string): string =>
+    [
+      "## 当前任务", `- 做事${bullet}`,
+      "## 已完成", `- 做完${bullet}`,
+      "## 未完成", `- 下一步${bullet}`,
+      "## 约束", `- 约束${bullet}`,
+      "## 文件与命令", `- 路径${bullet}`,
+      "## 在跑作业与句柄", "- 无",
+    ].join("\n");
+
+  const tight = parseSummary(withEvidence("。证据: src/summary.ts:60"));
+  assert(tight.bullets[0].fact === "做事。", "「。」后直接写「证据:」仍然合规（不需要前置空格）");
+  assert(tight.bullets[0].evidence === "src/summary.ts:60", "定位原样取出");
+
+  const annotated = parseSummary(withEvidence("证据: src/summary.ts:60（含中文说明）"));
+  assert(annotated.bullets[0].evidence === "src/summary.ts:60（含中文说明）", "定位后面的中文说明保留在证据里");
+
+  const repeated = parseSummary(withEvidence("要求行内出现 证据: 即可，真正的定位 证据: src/summary.ts:68"));
+  assert(repeated.bullets[0].evidence === "src/summary.ts:68", "事实里重复出现「证据」时按最后一处切分");
+
+  try {
+    parseSummary(withEvidence("这条没有任何定位"));
+    assert(false, "没有「证据:」的条目应当被拒绝");
+  } catch (e) {
+    const text = e instanceof Error ? e.message : String(e);
+    assert(/证据/.test(text) && text.includes("空格可省"), "缺证据的报错说明可接受的形式");
+  }
 }
 
 console.log(failures === 0 ? "\nALL OK" : `\n${failures} FAILURE(S)`);
