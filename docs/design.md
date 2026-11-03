@@ -1,19 +1,30 @@
-# DCP for omp — Design (anchor mode)
+# DCP for omp — Design (anchor mode, chained summaries)
 
 Dynamic Context Pruning for Oh My Pi, distilled to a single mechanism:
 **model-driven compression of the conversation span from a named anchor up to
-the compress call itself**.
+the compress call itself**, with absorbed spans preserved as a **chain** rather
+than merged away.
+
 Originally modeled on
 [Opencode-DCP/opencode-dynamic-context-pruning](https://github.com/Opencode-DCP/opencode-dynamic-context-pruning);
 the automatic strategies, nudges, commands, and config system were removed in
 favor of explicit, model-placed anchors.
 
-## Core invariant
+## Core invariants
 
-**Session history is never modified.** DCP only transforms the *copy* of the
-conversation sent to the LLM on each provider request (omp's `context` event;
-verified LLM-only in `pi-agent-core/src/agent-loop.ts`). Compressed spans are
-replaced with summaries; the persisted session stays byte-for-byte intact.
+- **Session history is never modified.** DCP only transforms the *copy* of the
+  conversation sent to the LLM on each provider request (omp's `context`
+  event; verified LLM-only in `pi-agent-core/src/agent-loop.ts`). The
+  persisted session stays byte-for-byte intact.
+- **No block text is ever destroyed.** A compression that absorbs an older
+  block records it in the chain; the older block's summary stays in state and
+  comes back through `expand`. (INV-1)
+- **No rejection for content.** A summary that deviates from the recommended
+  shape still compresses; the deviation rides the result as an advisory.
+  (INV-2)
+- **A failed call mutates nothing** — errors are reserved for calls that cannot
+  mean anything (unknown anchor, empty span, empty summary, unknown block id).
+  (INV-3)
 
 ## Anchors
 
@@ -28,6 +39,14 @@ An anchor is a named position in the conversation:
   first user message (role `user` without `tool_result` blocks — the original
   prompt). It is never consumed and is always available as a `startAnchor`.
 
+Anchor lifecycle is the model's job, and the tools say so explicitly:
+`add_anchor` returns "this marks where the NEXT span starts", so the workflow is
+*anchor A → work → anchor B → compress(A) → work → anchor C → compress(B)*. A
+single anchor followed by `compress` consumes the anchor it just placed — the
+pre-chain design let that happen silently and the model then always fell back to
+`session_start` (live evidence: one anchor in 350 tool calls, absorbed 71 s
+after it was created, three full-session compressions in 68 minutes).
+
 ## Message representation (verified against live transcripts)
 
 The `context` event fires before `convertToLlm` (pi-mono `agent-loop.ts`), so
@@ -36,7 +55,7 @@ messages use the internal pi-mono shape, **not** the Anthropic wire shape:
 - assistant messages carry `{type:"toolCall", id, name, arguments}` blocks;
 - tool results are standalone `{role:"toolResult", toolCallId, toolName,
   content, isError}` messages — not `tool_result` blocks inside a user message;
-- user message content may be a plain string.
+- user message content may be a plain string or a block array.
 
 Extension tools surface in the transcript through the harness's xd:// device
 layer: the model invokes them via the built-in `write` tool, so an anchor call
@@ -46,36 +65,47 @@ recognizes both the direct `add_anchor(...)` form and the xd envelope (anchor
 name from the `anchor` arg, falling back to a lone string value — models
 sometimes guess `name`). Stripping is id-based and therefore shape-agnostic.
 
-(The pre-rewrite `omp.d.ts` declared Anthropic-style `tool_use`/`tool_result`
-blocks; that shape never occurs, and code written against it silently no-ops —
-which is exactly how the first anchor-mode build failed in production.)
-
 ## compress semantics
 
-`compress({ startAnchor, summary, force? })` resolves the anchor on the
-persisted branch (`ctx.sessionManager.getBranch()`), validates, and records a
-compression block. **The end of the span is implicit: the compress call
-itself.** There is no `endAnchor` — a span always runs from the start anchor
-to the point where the model calls compress. When execute runs, the in-flight
-compress call is usually not yet appended to the branch; it lands at the end,
-so the end position falls back to `messages.length` (validation and elision
-counting only — the durable identity is the compress call's tool-call id).
-
-Two gates run before any branch scanning, so a rejected call mutates nothing
-(INV-4):
-
-1. `startAnchor === "session_start"` requires `force: true`;
-2. `validateSummary(summary, { full: startAnchor === "session_start" })` —
-   the fixed-slot schema below; `full` selects the strict tier.
+`compress({ startAnchor, summary })` resolves the anchor on the persisted
+branch (`ctx.sessionManager.getBranch()`), validates the span, records a block.
+**The end of the span is implicit: the compress call itself.** There is no
+`endAnchor`. When execute runs, the in-flight compress call is usually not yet
+appended to the branch; it lands at the end, so the end position falls back to
+`messages.length` (validation and elision counting only — the durable identity
+is the compress call's tool-call id).
 
 ```ts
 {
   id, startName, startToolCallId /* null = session_start */,
-  summary, compressCallId /* implicit span end */, createdAt
+  summary, compressCallId /* implicit span end */,
+  parentIds,   // blocks this one absorbed, newest first
+  supersededBy, // id of the block that absorbed this one, null while live
+  createdAt
 }
 ```
 
-The context transform then applies every active block:
+Preconditions that still throw: non-empty `startAnchor`, non-empty `summary`,
+an anchor that exists, and a span with at least one message in it.
+
+### Chain, not merge
+
+Every live block whose compress call falls inside the new span is absorbed:
+`parentIds` gains its id and it is marked `supersededBy = newId`. Its summary
+text is **kept**, and `expand({block})` returns it verbatim (plus its own index
+lines, so the walk can continue).
+
+Why the chain replaces content validation: an earlier design required the new
+summary to re-state every locator recorded by the block it absorbed, and
+rejected the compression otherwise. Measured cost in session 01a19fdd: 3 of 20
+compressions rejected for missing locators — after the model had already spent
+turns rewriting identifiers to match a string comparison. The chain makes the
+requirement moot: the old text is still there, so "merge, don't rewrite" is no
+longer a rule the model can fail.
+
+### Rendering
+
+The context transform applies every live block:
 
 - whole-elide messages in `(startMsgIdx, compressMsgIdx)` — for
   `session_start` starts, `[firstUser+1, compressMsgIdx)`;
@@ -88,9 +118,18 @@ The context transform then applies every active block:
 - keep the compress call itself and its toolResult in context — the call is
   the span's end, and the success confirmation is the visible record that the
   compression happened;
-- inject `[Compressed: start → here]\n<summary>` as a synthetic user message
-  right **before** the compress call's message — the summary takes the elided
-  span's place and the compress call follows it.
+- inject `[Compressed: start → here] (block N)\n<summary>` as a synthetic user
+  message right before the compress call's message, followed by one index line
+  per ancestor:
+
+  ```
+  已并入本块的旧压缩块（索引，全文未丢失）:
+  - 块 12「a1」：<当前任务 gist> — 全文: expand({block: 12})
+  ```
+
+Ancestors are one line each, so the chain costs O(history) in lines rather than
+bytes. Superseded blocks are text-only: they never elide anything, and they are
+never dropped — `expand` must still be able to return them.
 
 ### Provider-validity guards
 
@@ -106,188 +145,119 @@ from stalling:
   stripped as well (call/result pairing). Typical case: the start anchor's
   message also carried other tool calls whose results fall inside the span.
 
-### Accumulation, absorption, and overlap rules
+Blocks whose anchors or compress call no longer resolve (fork/compaction
+residue) are dropped and the state marked dirty so the next flush persists the
+cleanup.
 
-The new span always ends at the new compress call `N` (eliding
-`[N_lo, N_idx)`). An existing block B elides `[B_lo, B_hi)` where `B_hi` is
-the message index of B's own compress call — always before `N`:
+## Summary shape (`src/summary.ts`) — requested, never enforced
 
-| Situation | Rule |
+A free-form summary is a lossy paraphrase, so the tool asks for a fixed slot
+structure:
+
+| Slot (recommended order) | Purpose |
 | --- | --- |
-| `B_hi < N_lo` | keep B — B ends before the new span starts; its summary and compress pair stay in place, summaries **accumulate** in order |
-| `B_hi ≥ N_lo` and `B_lo ≥ N_lo` | consume B — fully contained (B's compress call, summary injection point, and span all fall inside the new span), absorbed into the new summary |
-| `B_hi ≥ N_lo` and `B_lo < N_lo` | reject — the start anchor lies inside B's active span; absorbing half of B would leave a dead block whose injection point is elided |
-
-Invariants these rules preserve:
-
-- **INV-1** distinct surviving blocks have distinct compress calls (one call
-  per block by construction).
-- **INV-2** a surviving block's compress call and summary injection point are
-  never elided by another surviving block.
-- **INV-4** a failed compress (thrown validation) mutates no state.
-
-Tool_use/tool_result pairs are always stripped together (no orphan blocks);
-messages left empty are dropped.
-
-## Summary schema (`src/summary.ts`)
-
-A free-form summary fails in two ways that a later turn cannot detect: it
-drops what the model forgot to write (session 01a18b4e, 2026-10-30: 22
-full-session compressions, several of them silently dropping the live user
-instruction), and its prose cannot be distinguished from invention. The
-schema makes both checkable at the tool boundary:
-
-| Slot (fixed order) | Purpose |
-| --- | --- |
-| `当前任务` | what is actually being worked on — mandatory, never `无` |
+| `当前任务` | what is actually being worked on |
 | `已完成` | actions/conclusions reached in the span |
 | `未完成` | the next concrete action |
 | `约束` | user requirements, invariants, prohibitions |
 | `文件与命令` | key paths, entry points, reproducible commands |
 | `在跑作业与句柄` | background jobs, subagent ids, service ports |
 
-Structure rules (all tiers): each slot exactly once and in order; every line
-inside a slot is `- <fact> 证据: <locator>`; an empty slot is `- 无`; no
-free-form preamble before `## 当前任务`; facts ≤ 600 chars so the summary
-carries pointers instead of pasted content; `证据` must not be `无`.
+Each fact is a `- ` bullet ending in `证据: <定位>` — a pointer (path,
+`file:line`, session id, commit, URI, command) the next turn can re-read instead
+of trusting a paraphrase.
 
-Evidence is the externalization mechanism: a fact names where it lives
-(path, `file:line`, session id, tool name, command) so the next turn can
-re-read the source instead of trusting the paraphrase.
+The parser **counts deviations and keeps going**: missing slots, unknown
+headers, missing evidence pointers, non-bullet lines. They come back in the
+compress result as `摘要形状提示（已压缩，未拒绝）`. Reasons for dropping the old
+gates (`LOCATOR_RE`, `FACT_MAX`, `EVIDENCE_MAX`, the strict tier, and the
+locator-inheritance check):
 
-Strict tier (`full: true`, i.e. `session_start` + `force`): `已完成` and
-`未完成` must carry real content, and every evidence pointer must contain a
-locator (`:`, `#`, `/`, `\`, `@`). This is the deliberate "cost" of
-full-session compression — it discards the most and therefore must prove the
-most. Tier 1 stays cheap (a vague pointer is tolerated) so ordinary
-compressions do not lose their main benefit.
-
-### Baseline inheritance (absorbing a prior block)
-
-Slots constrain the *shape* of a summary, not its *content*, and a compress
-that absorbs a block deletes the only copy of what that block recorded. Slot
-structure alone does not stop the loss: session 01a18dc1 (2026-10-30) had
-three well-formed blocks, and the third replaced the second's finished
-implementation record with an analysis-only summary — the next turn then
-re-proposed work that was already done and committed.
-
-`compress` therefore runs `validateInheritance` before mutating state whenever
-the span contains prior blocks:
-
-- Every locator recorded in the absorbed blocks' `已完成` / `约束` /
-  `文件与命令` slots must still appear somewhere in the new summary. Locators
-  are backticked identifiers, file paths and CONSTANT forms — the things a
-  later turn can re-find in the repository.
-- Moving slots and merging bullets is fine; the check is on locators, not on
-  wording or position.
-- An obsolete fact stays valid if its bullet keeps the locator and says
-  `已废弃: <原因>`.
-- Prose facts without a locator are not checked, and blocks written before the
-  schema (unparseable) are skipped — history never blocks a compression.
-- A rejection lists the missing locators and leaves state untouched (INV-4).
-
-The check is deliberately mechanical: it fails a compress for dropping a
-pointer, and the model is expected to merge rather than rewrite. Verified
-against the real regression pair (blocks 2 → 3 of 01a18dc1): the old summary
-is refused with 14 missing locators listed.
-
-## Modules
-
-```
-index.ts        extension factory: registers context handler, lifecycle, tools
-src/
-  omp.d.ts      ambient declarations for the omp API surface used
-  anchors.ts    anchor model: scanAnchors, session_start, toolCall/toolResult lookup
-  state.ts      SessionState, CompressionBlock, dcp-state (v3) persistence
-  tools.ts      add_anchor + compress tool factories
-  summary.ts    summary schema: fixed slots, evidence pointers, strict tier
-  transform.ts  the context-transform heart: elide / strip / inject
-  remind.ts     compress reminders: token budget, todo-set completion, tool-call budget
-  prompts.ts    tool descriptions, marker + summary formats
-  logger.ts     debug logger (~/.omp/agent/logs/dcp, DCP_DEBUG=1)
-smoke-test.ts   bun smoke test over synthetic omp messages
-```
-
-## Session lifecycle
-
-| Event | Action |
-| ----- | ------ |
-| `session_start` / `session_switch` | bind: reset if the session id changed, load latest `dcp-state` entry, track latest compaction timestamp |
-| `session_before_switch` / `session_shutdown` | flush dirty state into the current session |
-| `session_compact` | clear all blocks (anchors may be compacted away) + persist the cleared state |
-| `context` | lazy-bind if unbound; reconcile omp-side compaction by branch timestamps; clone → transform → append at most one reminder → return |
-
-Same-session re-bind is a no-op, so in-flight compress state is never wiped.
+- a rejection costs a full turn and the model re-sends the draft — 17 of 20
+  compressions in session 01a19fdd were rejected, 9 of them by a whitelist that
+  demanded a `:` `/` `@` `#` or `\` and therefore refused a real commit hash
+  (`7756e8c`), real root-level filenames (`stonecutter.properties.toml`,
+  `.mcmcp`) and `git log --oneline -3` — a form its own error text listed as
+  acceptable;
+- the checks measured shape, not value: a summary that passed every rule still
+  recorded `spawn_chance = 1.0` against a real default of `0.2`, and inherited
+  that error forward;
+- the model learned the validator instead of the lesson — live thinking:
+  "gradle.properties has no slash. Use E:/…/gradle.properties? That contains
+  slashes.";
+- evidence locators are a *convention*, and a convention can be carried by the
+  prompt plus the chain (the old text is always one `expand` away), which is
+  where the constraint now lives.
 
 ## Compress reminders
 
 dcp is model-driven: nothing forces a compress, and omp auto-compaction is
-commonly disabled in favor of dcp. A model that forgets walks the context past
-the window and the session stalls (observed 2026-10-01: 264k on a 256k
-window, turns dying with `stopReason: "length"`). Three triggers, all computed
-on the already-transformed copy and all appended as a synthetic user message
-that is never persisted:
+commonly disabled in favor of dcp. Two triggers, both computed on the
+already-transformed copy, both appended as a synthetic user message that is
+never persisted:
 
 | Marker | Fires when | Configuration |
 | ------ | ---------- | ------------- |
 | `[dcp:context]` | estimated post-transform context crosses the token budget | `DCP_REMIND_THRESHOLD`: (0,1) = fraction of the model window (default 0.4); >=1 = absolute tokens; <=0 = off |
-| `[dcp:unit]` | the newest `todo` result reports a finished item set (`All items complete` / `Remaining items (0)`) | none — the boundary is observable, not judged |
-| `[dcp:budget]` | N tool calls have run since the last compress | `DCP_REMIND_TOOLCALLS` (default 40, <=0 = off) |
+| `[dcp:unit]` | the newest `todo` result reports a finished item set | none — the boundary is observable, not judged |
 
-At most one reminder is appended per request; priority is
-`[dcp:context]` > `[dcp:unit]` > `[dcp:budget]`.
-`[dcp:context]` and `[dcp:unit]` recompute from scratch on the transformed
-copy, so a compression silences them naturally.
+At most one reminder per request; `[dcp:context]` wins.
 
-`[dcp:budget]` is measured against `SessionState.toolCallMark`, a durable
-watermark that `compress.execute` writes (`countToolCalls(messages)` at the
-moment of compression). The earlier implementation scanned the message stream
-for the newest compress call instead, which silently missed every compression
-issued through a channel that leaves no `write({path:"xd://compress"})` block —
-the eval kernel (`await tool.write(...)`), subagent-internal calls, or any
-programmatic caller. Live session 01a18dc1 hit this: a compression at 17:57:31
-succeeded and persisted its block, yet the stream still showed the last visible
-compress at 17:51:23, so every later request reported a budget overrun that had
-already been paid (60, then 85, growing). Because `execute` runs for every
-caller path, the watermark cannot be skipped; it rides `dcp-state` and resets
-when a compaction clears the blocks.
+`[dcp:unit]` dedupes on the todo result's `toolCallId` (persisted as
+`unitRemindId`): the newest finished todo result stays "finished" until the model
+calls `todo` again, so without the watermark the reminder would repeat on every
+request for the rest of the session. The finished-set wording is matched across
+hosts: `All items complete`, `Remaining items (0)`, and the current
+`Remaining items: none.` / `0 open`.
 
-The reminder text lists named anchors as peers and calls `session_start` out
-separately — a full-session wipe needs `force=true`, the strict summary tier,
-and must merge every locator of the block it absorbs. Offering it inside
-"startAnchor one of ..." made the reminder recommend a call that fails
-validation.
+`[dcp:context]` brackets its reports (one per further 10% of the window,
+persisted as `remindLevel`) so a context that sits above the threshold does not
+re-nag every request.
 
-Estimate: newest assistant usage report anchors the total, tail counted at
-~4 chars/token (see `estimateContextTokens`). Known limitation: right after a
-compress the newest usage report can still be the stale pre-compression one,
-so the token reminder may fire once more before the next turn corrects it.
+**There is no tool-call counter.** The removed `[dcp:budget]` fired at 40 calls
+regardless of context size; in session 01a19fdd that meant a compression three
+minutes in, on a context nowhere near the window, after which the model re-read
+three files it had just read. A call count is not a cost: one 40 KB read and one
+`todo` counted the same, and the reminder kept firing after compressions made
+through the eval kernel until it was given its own watermark. Token pressure is
+the only measurable cost, so it is the only trigger.
+
+Estimate: `newest assistant usage report + local tail`, where the tail is
+counted per character with CJK weighted separately (~2 chars/token) from ASCII
+(~4 chars/token) — a single 4 chars/token constant under-counted Chinese-heavy
+sessions by ~40% (measured 2.5 chars/token on the first uncompressed sample of
+01a19fdd). Known limitation: right after a compress the newest usage report can
+still be the stale pre-compression one, so `usageMark` suppresses it for one
+request.
 
 ## Persistence
 
-Only compression blocks are durable — anchors re-derive from history by
-scanning. State rides omp custom entries (`customType: "dcp-state"`, `v: 4`);
-the latest entry on the active branch wins. v1–v3 entries (range-mode and
-end-anchor eras) are ignored. Blocks whose anchors or compress call no longer
-resolve at transform time (fork/compaction residue) are dropped lazily and
-the state marked dirty so the next flush persists the cleanup.
+Compression blocks (including the chain) are durable; anchors re-derive from
+history by scanning. State rides omp custom entries (`customType: "dcp-state"`,
+`v: 5`); the latest entry on the active branch wins. v4 entries (pre-chain,
+absorbed blocks already deleted) are migrated as chain roots; v1–v3 are ignored.
+Blocks whose anchors or compress call no longer resolve at transform time
+(fork/compaction residue) are dropped lazily and the state marked dirty so the
+next flush persists the cleanup.
 
 ## Errors surface to the model
 
-Both tools fail by throwing — the model sees the error tool_result and no
-state changes. Unknown-anchor errors list the available anchors so the model
-can recover immediately. Schema errors name the offending line and restate the
-required shape (slot list, `- ` bullet form, `证据: <定位>` suffix), so a
-rejected compression comes back as a concrete rewrite instruction rather than
-a generic refusal.
+Content problems never surface as errors — they are advisories inside a
+successful result. Hard errors (unknown anchor / block, empty span) list the
+available anchors or block ids so the model can recover in the same turn.
 
-## Deliberately removed (vs. the range-mode port)
+## Deliberately removed
 
 - deduplication / purge-errors strategies and all nudges — compression is
   explicit now;
 - slash commands, prune notifications, protected tools/file patterns,
   protected-content append, system-prompt injection;
-- the layered `dcp.jsonc` config system (no configuration remains; debug is
-  `DCP_DEBUG`);
+- the layered `dcp.jsonc` config system (debug is `DCP_DEBUG`);
 - content-signature message identity and verbatim-phrase anchor resolution —
-  named anchors make both unnecessary.
+  named anchors make both unnecessary;
+- the summary **gates**: locator whitelist, fact/evidence length caps, strict
+  tier for `session_start`, `force=true`, and locator inheritance. They were
+  added as patches to three separate incidents (commits `2e18809`, `54a9ade`,
+  `3caea33`) and collectively rejected 17 of 20 real compressions, while still
+  letting a wrong fact through;
+- the tool-call budget reminder and its durable watermark.

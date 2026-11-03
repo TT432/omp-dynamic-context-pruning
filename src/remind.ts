@@ -2,32 +2,35 @@
  * Compress reminders.
  *
  * dcp is model-driven: nothing forces a compress, and omp auto-compaction is
- * commonly disabled in favor of dcp. Three triggers append a synthetic user
+ * commonly disabled in favor of dcp. Two triggers append a synthetic user
  * message to the LLM-facing copy (never persisted):
  *
  *   1. `[dcp:context]` — estimated context crosses the token budget
  *      (DCP_REMIND_THRESHOLD). Guards against the stall observed 2026-10-01:
  *      264k tokens on a 256k window, turns dying with stopReason "length".
- *   2. `[dcp:unit]` — the newest `todo` result reports a completed item set
- *      ("All items complete" / "Remaining items (0)"). That is the work-unit
- *      boundary the global AGENTS.md used to describe in prose; the trigger
- *      makes the boundary observable instead of judged.
- *   3. `[dcp:budget]` — N tool calls have run since the last compress
- *      (DCP_REMIND_TOOLCALLS). Observed unit size in 20 sessions: ~36 tool
- *      calls per todo item (1377 calls / 38 todo ops), hence the default 40.
+ *   2. `[dcp:unit]` — the newest `todo` result reports a completed item set.
+ *      That is a work-unit boundary, and it is observable rather than judged.
  *
- * Only one reminder is appended per request; token pressure wins over unit
- * boundary, which wins over the call budget. All three stop firing once the
- * span is compressed, because the reminder is computed on the already
- * transformed message copy.
+ * There is deliberately no "N tool calls since the last compress" trigger. It
+ * was removed after session 01a19fdd: it fired at 40 calls, three minutes in,
+ * on a context that was nowhere near the window, and the compress that followed
+ * threw away the exploration the model was still using (it re-read three files
+ * immediately after). Tool-call count is not context cost — one 40KB read and
+ * one `todo` counted the same.
+ *
+ * Only one reminder is appended per request; token pressure wins.
+ * `[dcp:context]` recomputes on the transformed copy, so a compression silences
+ * it. `[dcp:unit]` dedupes on the todo result's toolCallId: the newest finished
+ * todo result stays "finished" until the model calls `todo` again, so without a
+ * watermark the reminder would repeat on every request for the rest of the
+ * session.
  *
  * Estimate: newest assistant message with a provider usage report anchors the
  * total (that report describes the transformed prompt of the previous
- * request); messages after it are counted locally at ~4 chars/token. Without
- * any usage report the whole conversation is counted locally. Known
- * limitation: right after a compress the newest usage report can still be the
- * stale pre-compression one, so the token reminder may fire once more before
- * the next turn's fresh report corrects it.
+ * request); messages after it are counted locally. Without any usage report the
+ * whole conversation is counted locally. Known limitation: right after a
+ * compress the newest usage report can still be the stale pre-compression one,
+ * so the token reminder may fire once more before the next turn corrects it.
  *
  * Threshold (env DCP_REMIND_THRESHOLD):
  *   0 < v < 1  → fraction of the model's context window (default 0.4);
@@ -36,36 +39,34 @@
  */
 
 import type { AgentMessage, ContentBlock, ExtensionContext, MessageUsage } from "./omp";
-import { isToolCallBlock, scanAnchors } from "./anchors";
+import { scanAnchors } from "./anchors";
 
 /** Prefix identifying the over-threshold reminder (LLM-facing copy only). */
 export const REMIND_MARKER = "[dcp:context]";
 /** Prefix identifying the work-unit-boundary reminder. */
 export const UNIT_MARKER = "[dcp:unit]";
-/** Prefix identifying the tool-call-budget reminder. */
-export const BUDGET_MARKER = "[dcp:budget]";
 
 export const DEFAULT_TOKEN_THRESHOLD = 0.4;
-export const DEFAULT_TOOLCALL_BUDGET = 40;
 
 /** When to nudge the model to compress. */
 export interface RemindPolicy {
   /** (0,1) = fraction of the context window, >=1 = absolute tokens, <=0 = off. */
   tokenThreshold: number;
-  /** Tool calls since the last compress before nudging; <=0 = off. */
-  toolCallBudget: number;
 }
 
 const CHARS_PER_TOKEN = 4;
+/** CJK text costs roughly twice as many tokens per character as ASCII. */
+const CJK_CHARS_PER_TOKEN = 2;
 
-/**
- * `session_start` is not a peer of the named anchors: it wipes everything and
- * therefore demands force + the strict tier. Listing it inside "startAnchor one
- * of ..." made the reminder recommend a call that fails validation, so it is
- * called out separately.
- */
+/** A finished todo set, with the identity of the result that reported it. */
+export interface FinishedUnit {
+  /** toolCallId of the `todo` call that produced the result — the dedupe key. */
+  id: string;
+  text: string;
+}
+
 const FULL_SESSION_HINT =
-  'Do not reach for "session_start" as a shortcut: a full-session wipe needs force=true, the strict summary tier, and must merge every locator of the block it absorbs.';
+  'Full-session compression ("session_start") is allowed and nothing is destroyed — absorbed blocks stay recallable with expand — but it is the most lossy call available: prefer compressing a span that starts at an anchor placed after the finished unit.';
 
 function num(raw: string | undefined, fallback: number): number {
   const trimmed = (raw ?? "").trim();
@@ -78,7 +79,6 @@ function num(raw: string | undefined, fallback: number): number {
 export function parseRemindPolicy(env: Record<string, string | undefined>): RemindPolicy {
   return {
     tokenThreshold: num(env.DCP_REMIND_THRESHOLD, DEFAULT_TOKEN_THRESHOLD),
-    toolCallBudget: num(env.DCP_REMIND_TOOLCALLS, DEFAULT_TOOLCALL_BUDGET),
   };
 }
 
@@ -104,12 +104,23 @@ function blockText(block: ContentBlock): string {
   return "";
 }
 
-function messageChars(message: AgentMessage): number {
+/** CJK characters tokenize far denser than Latin ones — weight them separately. */
+function textTokens(text: string): number {
+  let cjk = 0;
+  for (let i = 0; i < text.length; i++) {
+    const code = text.charCodeAt(i);
+    if (code >= 0x2e80 && code <= 0x9fff) cjk++;
+  }
+  const rest = text.length - cjk;
+  return Math.ceil(cjk / CJK_CHARS_PER_TOKEN + rest / CHARS_PER_TOKEN);
+}
+
+function messageTokens(message: AgentMessage): number {
   const content = message.content;
-  if (typeof content === "string") return content.length;
+  if (typeof content === "string") return textTokens(content);
   if (!Array.isArray(content)) return 0;
   let n = 0;
-  for (const block of content) n += blockText(block).length;
+  for (const block of content) n += textTokens(blockText(block));
   return n;
 }
 
@@ -142,12 +153,12 @@ export function estimateContextTokens(messages: AgentMessage[], staleUsage = 0):
     if (anchored === undefined) continue;
     if (staleUsage > 0 && anchored === staleUsage) break;
     let tail = 0;
-    for (let j = i + 1; j < messages.length; j++) tail += messageChars(messages[j]);
-    return anchored + Math.ceil(tail / CHARS_PER_TOKEN);
+    for (let j = i + 1; j < messages.length; j++) tail += messageTokens(messages[j]);
+    return anchored + tail;
   }
   let all = 0;
-  for (const m of messages) all += messageChars(m);
-  return Math.ceil(all / CHARS_PER_TOKEN);
+  for (const m of messages) all += messageTokens(m);
+  return all;
 }
 
 /** Context window from the live model or omp's usage snapshot; undefined if unknown. */
@@ -155,8 +166,8 @@ export function resolveContextWindow(ctx: ExtensionContext): number | undefined 
   const fromModel = ctx.model?.contextWindow;
   if (typeof fromModel === "number" && fromModel > 0) return fromModel;
   const usage = ctx.getContextUsage?.();
-  const fromUsage = usage?.contextWindow ?? usage?.limit;
-  return typeof fromUsage === "number" && fromUsage > 0 ? fromUsage : undefined;
+  const fromWindow = usage?.contextWindow ?? usage?.limit;
+  return typeof fromWindow === "number" && fromWindow > 0 ? fromWindow : undefined;
 }
 
 /** Effective token budget for the reminder, or undefined when undeterminable. */
@@ -167,52 +178,39 @@ export function remindBudget(threshold: number, ctx: ExtensionContext): number |
   return window === undefined ? undefined : Math.floor(window * threshold);
 }
 
-/** Total tool calls in the (transformed) conversation. */
-export function countToolCalls(messages: AgentMessage[]): number {
-  let count = 0;
-  for (const message of messages) {
-    const content = message.content;
-    if (!Array.isArray(content)) continue;
-    for (const block of content) if (isToolCallBlock(block)) count++;
-  }
-  return count;
-}
-
-/**
- * Tool calls issued since the last compression, measured against the durable
- * watermark instead of a scan for a compress call.
- *
- * The scan was wrong whenever the compress went through a channel that leaves
- * no `write({path:"xd://compress"})` block — notably the eval kernel
- * (`await tool.write(...)`) and any programmatic caller. The compression still
- * ran and still replaced the context, but the counter kept growing, so every
- * later request claimed a budget overrun. The watermark is written by
- * `compress.execute` itself, so every path is accounted for.
- */
-export function toolCallsSinceLastCompress(messages: AgentMessage[], mark = 0): number {
-  return Math.max(0, countToolCalls(messages) - mark);
-}
-
-/**
- * Text of the newest `todo` tool result when it reports a finished item set,
- * else null. Losing the todo list (post-compaction) is not a completion.
- */
-export function finishedTodoSet(messages: AgentMessage[]): string | null {
-  for (let i = messages.length - 1; i >= 0; i--) {
-    const m = messages[i] as AgentMessage & { toolName?: string };
-    if (m.role !== "toolResult" || m.toolName !== "todo") continue;
-    const text = messageText(m);
-    if (/All items complete/i.test(text) || /Remaining items \(0\)/i.test(text)) return text;
-    return null; // newest todo result is mid-progress → no boundary
-  }
-  return null;
-}
-
 function messageText(message: AgentMessage): string {
   const content = message.content;
   if (typeof content === "string") return content;
   if (!Array.isArray(content)) return "";
   return content.map((b) => blockText(b)).join("\n");
+}
+
+/**
+ * Newest `todo` result when it reports a finished item set, else null.
+ * Losing the todo list (post-compaction) is not a completion.
+ *
+ * The finished-set wording differs between hosts — observed live:
+ * "Remaining items: none." + "Overall: 4/4 done, 0 open.", and the older
+ * "All items complete" / "Remaining items (0)". The old pattern only matched
+ * the second pair, so the unit trigger was dead code on the current host.
+ */
+export function finishedTodoSet(messages: AgentMessage[]): FinishedUnit | null {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i] as AgentMessage & { toolName?: string };
+    if (m.role !== "toolResult" || m.toolName !== "todo") continue;
+    const text = messageText(m);
+    if (
+      /All items complete/i.test(text) ||
+      /Remaining items \(0\)/i.test(text) ||
+      /Remaining items:\s*none/i.test(text) ||
+      /\b0 open\b/i.test(text)
+    ) {
+      const id = typeof m.toolCallId === "string" ? m.toolCallId : text.slice(0, 32);
+      return { id, text };
+    }
+    return null; // newest todo result is mid-progress → no boundary
+  }
+  return null;
 }
 
 function anchorList(messages: AgentMessage[]): string {
@@ -221,13 +219,11 @@ function anchorList(messages: AgentMessage[]): string {
     .join(", ");
 }
 
-/**
- * Append at most one reminder to the LLM-facing message copy. Returns the
- * input array unchanged (same reference) when no reminder is warranted.
- */
 /** Mutable cursor holding the highest bracket already reported. */
 export interface RemindCursor {
   remindLevel: number;
+  /** toolCallId of the finished todo set already reported (dedupe). */
+  unitRemindId: string | null;
 }
 
 /** Above the threshold, one reminder per further 10% of the budget. */
@@ -246,7 +242,6 @@ export function maybeAppendReminder(
   messages: AgentMessage[],
   ctx: ExtensionContext,
   policy: RemindPolicy,
-  mark = 0,
   staleUsage = 0,
   cursor?: RemindCursor,
 ): AgentMessage[] {
@@ -274,27 +269,16 @@ export function maybeAppendReminder(
     }
   }
 
-  if (finishedTodoSet(messages) !== null) {
+  const unit = finishedTodoSet(messages);
+  if (unit !== null && (cursor === undefined || cursor.unitRemindId !== unit.id)) {
+    if (cursor !== undefined) cursor.unitRemindId = unit.id;
     return append(
       messages,
       `${UNIT_MARKER} The todo set just completed — that is a work-unit boundary. ` +
-        `Place an anchor at the start of the next unit, then compress the finished one: ` +
-        `compress with startAnchor one of ${anchorList(messages) || '"your own anchor"'}, and make the summary state ` +
-        `当前任务 / 刚完成的动作 / 下一步具体动作. ${FULL_SESSION_HINT}`,
+        `Place an anchor for the next unit, then compress the finished one: ` +
+        `compress with startAnchor one of ${anchorList(messages) || '"your own anchor"'} and a summary whose 当前任务 ` +
+        `says what the next turn should do first. ${FULL_SESSION_HINT}`,
     );
-  }
-
-  if (policy.toolCallBudget > 0) {
-    const used = toolCallsSinceLastCompress(messages, mark);
-    if (used >= policy.toolCallBudget) {
-      return append(
-        messages,
-        `${BUDGET_MARKER} ${used} tool calls have run since the last compress (budget ${policy.toolCallBudget}). ` +
-          `If this stretch has converged, place an anchor and compress it now (startAnchor one of ` +
-          `${anchorList(messages) || '"your own anchor"'}); if it has not, keep working — this reminder repeats until you compress. ` +
-          `${FULL_SESSION_HINT}`,
-      );
-    }
   }
 
   return messages;

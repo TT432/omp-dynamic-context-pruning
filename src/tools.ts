@@ -1,23 +1,17 @@
 /**
- * The two DCP tools.
+ * The three DCP tools: add_anchor, compress, expand.
  *
- * add_anchor — places a named anchor at the call site. The call itself is the
- * anchor: its provider-assigned tool-call id is the durable identity. Names are
- * unique per session and "session_start" is reserved.
- *
- * compress — replaces the span from a start anchor up to the compress call
- * itself with the model-authored summary. The end is implicit: this compress
- * call's position in the conversation. Resolves the anchor on the persisted
- * branch (positions are stable and even consumed anchors remain findable),
- * validates, absorbs fully-contained prior blocks, and records a
- * CompressionBlock. The context transform (transform.ts) applies the block to
- * future LLM requests; storage is never touched. Failed validation throws
- * before any state mutation (INV-4).
+ * Errors are reserved for calls that cannot mean anything — an unknown anchor,
+ * a span with nothing in it, an unknown block id. Everything else (summary
+ * shape, missing evidence pointers, a long line) comes back as an advisory in
+ * the result: a rejection costs a turn and the model reads the same text
+ * either way.
  */
 
 import type { AgentMessage, ExtensionAPI, ExtensionContext, SessionEntry, ToolDefinition, ToolResult } from "./omp";
 import type { Logger } from "./logger";
 import type { CompressionBlock, SessionState } from "./state";
+import { ancestorsOf, findBlock } from "./state";
 import {
   ADD_ANCHOR_TOOL,
   SESSION_START_ANCHOR,
@@ -26,9 +20,9 @@ import {
   scanAnchors,
   type AnchorRef,
 } from "./anchors";
-import { ADD_ANCHOR_PROMPT, COMPRESS_PROMPT } from "./prompts";
-import { validateInheritance, validateSummary } from "./summary";
-import { countToolCalls, latestUsageTokens } from "./remind";
+import { ADD_ANCHOR_PROMPT, COMPRESS_PROMPT, EXPAND_PROMPT } from "./prompts";
+import { formatProblems, gistOf, parseSummary } from "./summary";
+import { latestUsageTokens } from "./remind";
 
 // ---------------------------------------------------------------------------
 // shared helpers
@@ -36,9 +30,8 @@ import { countToolCalls, latestUsageTokens } from "./remind";
 
 function isAgentMessage(value: unknown): value is AgentMessage {
   if (typeof value !== "object" || value === null) return false;
-  if (!("role" in value) || typeof value.role !== "string") return false;
-  if (!("content" in value)) return false;
-  return typeof value.content === "string" || Array.isArray(value.content);
+  if (!("role" in value)) return false;
+  return typeof value.role === "string";
 }
 
 /** Messages of the persisted branch, in order. */
@@ -93,7 +86,6 @@ export function createAddAnchorTool(deps: AddAnchorToolDeps): ToolDefinition {
       if (typeof p.anchor !== "string") throw new Error('add_anchor requires a string "anchor" parameter');
       const name = p.anchor.trim();
       if (name.length === 0) throw new Error("anchor name must not be empty");
-      if (name.length > 64) throw new Error(`anchor name too long (${name.length} > 64 chars)`);
       if (/\s/.test(name)) throw new Error("anchor name must not contain whitespace");
       if (name === SESSION_START_ANCHOR) {
         throw new Error(`"${SESSION_START_ANCHOR}" is reserved for the built-in anchor after the original user prompt`);
@@ -107,7 +99,7 @@ export function createAddAnchorTool(deps: AddAnchorToolDeps): ToolDefinition {
 
       logger.info("Anchor added", { name, toolCallId });
       return textResult(
-        `Anchor "${name}" recorded at this point in the conversation. Cite it as startAnchor in a later compress call.`,
+        `Anchor "${name}" recorded here. It marks where the NEXT span starts: compress an earlier anchor (or "session_start") when this stretch ends, and keep this one as the start of what comes next.`,
         { anchor: name },
       );
     },
@@ -128,9 +120,14 @@ export interface CompressToolDeps {
 export function createCompressTool(deps: CompressToolDeps): ToolDefinition {
   const { state, logger, zod, persist } = deps;
   const parameters = zod.object({
-    startAnchor: zod.string({ description: "Anchor where compression starts (consumed); \"session_start\" compresses from the original prompt" }),
-    summary: zod.string({ description: "Slot-structured summary replacing everything from the anchor up to this compress call; the only record future turns will have. Required slot headers: ## 当前任务 / ## 已完成 / ## 未完成 / ## 约束 / ## 文件与命令 / ## 在跑作业与句柄, in that order; every fact is a `- ` bullet ending in `证据: <locator>`, an empty slot is `- 无`. Absorbing a prior compression deletes it: every locator it recorded under 已完成 / 约束 / 文件与命令 must still appear in this summary (say 「已废弃: <原因>」 with the locator if obsolete) or the compress is rejected." }),
-    force: zod.boolean({ description: 'Required (=true) when startAnchor is "session_start": full-session compression while work is in progress causes amnesia. Only confirm when the current work unit is complete. The summary must then pass the strict tier: 已完成 and 未完成 carry real content, and every 证据 must be a real locator (path, file:line, session id, URI or command).' }).optional(),
+    startAnchor: zod.string({
+      description:
+        'Anchor where compression starts (consumed); "session_start" compresses from the original prompt. Prefer a named anchor placed after a finished work unit.',
+    }),
+    summary: zod.string({
+      description:
+        "Your summary of everything from the anchor up to this call — the only record of that span in later turns (absorbed older blocks stay recallable through expand). Recommended slots, in order: ## 当前任务 / ## 已完成 / ## 未完成 / ## 约束 / ## 文件与命令 / ## 在跑作业与句柄; each fact a `- ` bullet ending in `证据: <定位>`. Shape is advisory: a summary that does not follow it is still applied.",
+    }),
   });
 
   return {
@@ -139,9 +136,7 @@ export function createCompressTool(deps: CompressToolDeps): ToolDefinition {
     description: COMPRESS_PROMPT,
     parameters,
     async execute(toolCallId, params, _signal, _onUpdate, ctx): Promise<ToolResult> {
-      // omp validates params against the zod schema before execute; fields are
-      // still re-checked below for precise error messages.
-      const p = params as { startAnchor?: unknown; summary?: unknown; force?: unknown };
+      const p = params as { startAnchor?: unknown; summary?: unknown };
       if (typeof p.startAnchor !== "string" || p.startAnchor.trim().length === 0) {
         throw new Error('compress requires a non-empty string "startAnchor"');
       }
@@ -151,27 +146,17 @@ export function createCompressTool(deps: CompressToolDeps): ToolDefinition {
       const startName = p.startAnchor.trim();
       const summary = p.summary;
 
-      // Full-session compression is the known amnesia footgun: require an
-      // explicit opt-in so it is never the accidental default mid-task.
-      if (startName === SESSION_START_ANCHOR && p.force !== true) {
-        throw new Error(
-          'Refusing to compress from "session_start" without force=true. Full-session compression discards all working context; if a work unit is still active this causes amnesia. Only confirm when the unit is complete, and the summary MUST state: 当前任务 / 刚完成的动作 / 下一步具体动作.',
-        );
-      }
-
-      // Schema check runs before any branch scanning or state mutation (INV-4).
-      // The strict tier applies to exactly the calls that discard everything.
-      const parsed = validateSummary(summary, { full: startName === SESSION_START_ANCHOR });
+      // Advisory only: shape problems ride the result, they never block the
+      // compression (a rejection costs a turn and the model re-sends the same
+      // draft anyway).
+      const parsed = parseSummary(summary);
 
       const messages = branchMessages(ctx);
       if (messages.length === 0) {
         throw new Error("no session messages available to compress; try again on a later turn");
       }
       const anchors = scanAnchors(messages);
-      const byName = new Map<string, AnchorRef>();
-      for (const a of anchors) byName.set(a.name, a);
-
-      const start = byName.get(startName);
+      const start = anchors.find((a) => a.name === startName);
       if (!start) {
         throw new Error(`unknown startAnchor "${startName}". Available anchors: ${anchorList(anchors)}`);
       }
@@ -183,45 +168,23 @@ export function createCompressTool(deps: CompressToolDeps): ToolDefinition {
       const endIdx = callIdx >= 0 ? callIdx : messages.length;
 
       // First whole-elided message index: for a real start the anchor message
-      // itself is only stripped of its anchor block, so elision starts after it;
+      // is only stripped of its anchor block, so elision starts after it;
       // for session_start elision starts right after the first user message.
       const elideFrom = start.toolCallId === null ? start.msgIndex : start.msgIndex + 1;
       if (elideFrom >= endIdx) {
         throw new Error(`range from "${startName}" to this compress call contains no messages to compress`);
       }
 
-      const firstUser = firstUserMessageIndex(messages);
-      const consumed: CompressionBlock[] = [];
+      // Absorb every live block whose compress call falls inside the new span.
+      // Its summary stays in state and is rendered as an index line under the
+      // new block, so absorbing is loss-free and needs no merge validation.
+      const absorbed: CompressionBlock[] = [];
       for (const b of state.blocks) {
-        // b's implicit end is its own compress call — always before this one.
+        if (b.supersededBy !== null) continue;
         const bEndIdx = findToolCallIndex(messages, b.compressCallId);
-        const bStartIdx =
-          b.startToolCallId === null
-            ? firstUser >= 0
-              ? firstUser + 1
-              : -1
-            : findToolCallIndex(messages, b.startToolCallId);
-        if (bEndIdx < 0 || bStartIdx < 0) continue; // orphan block — the transform drops it
-        const bLo = b.startToolCallId === null ? bStartIdx : bStartIdx + 1;
-        if (bEndIdx < elideFrom) continue; // entirely before the new span — summaries accumulate
-        // b's compress call falls inside the new span. b may only survive fully
-        // contained — otherwise its summary injection point would be elided
-        // while its span still applies (a dead, half-applied block).
-        if (bLo < elideFrom) {
-          throw new Error(
-            `startAnchor "${startName}" lies inside the active compression from "${b.startName}" — compress from "${b.startName}" (or an earlier anchor) to absorb it, or place the startAnchor after it`,
-          );
-        }
-        consumed.push(b); // fully contained — absorbed into the new summary
+        if (bEndIdx < 0 || bEndIdx < elideFrom) continue;
+        absorbed.push(b);
       }
-
-      // Absorbing a block deletes the only copy of its facts, so the new
-      // summary must carry them (or mark them superseded). Runs after the
-      // schema check and after span resolution, still before any mutation.
-      validateInheritance(
-        consumed.map((b) => ({ blockId: b.id, startName: b.startName, summary: b.summary })),
-        parsed,
-      );
 
       const block: CompressionBlock = {
         id: state.nextBlockId++,
@@ -229,17 +192,12 @@ export function createCompressTool(deps: CompressToolDeps): ToolDefinition {
         startToolCallId: start.toolCallId,
         summary,
         compressCallId: toolCallId,
+        parentIds: absorbed.map((b) => b.id).sort((a, b) => b - a),
+        supersededBy: null,
         createdAt: Date.now(),
       };
-      if (consumed.length > 0) {
-        const consumedIds = new Set(consumed.map((b) => b.id));
-        state.blocks = state.blocks.filter((b) => !consumedIds.has(b.id));
-      }
+      for (const b of absorbed) b.supersededBy = block.id;
       state.blocks.push(block);
-      // The reminder budget is measured from here on: every caller path
-      // (direct write, eval kernel, programmatic) passes through execute, so
-      // the watermark can never be skipped the way a message scan was.
-      state.toolCallMark = countToolCalls(messages);
       // The newest usage report belongs to the pre-compression context; mark it
       // so the next estimate does not anchor on the size we just discarded.
       state.usageMark = latestUsageTokens(messages) ?? 0;
@@ -251,14 +209,73 @@ export function createCompressTool(deps: CompressToolDeps): ToolDefinition {
         blockId: block.id,
         from: startName,
         elidedMessages: elided,
-        consumedBlocks: consumed.map((b) => b.id),
+        absorbedBlocks: absorbed.map((b) => b.id),
+        problems: parsed.problems.length,
       });
 
-      const absorbed = consumed.length > 0 ? ` Absorbed ${consumed.length} prior compression(s).` : "";
+      const chain = ancestorsOf(state.blocks, block);
+      const absorbedNote =
+        chain.length > 0
+          ? ` Absorbed ${absorbed.length} prior block(s); the chain reaches back ${chain.length}: ${chain
+              .map((b) => `块 ${b.id}「${b.startName}」${gistOf(b.summary, 60) || "(无摘要)"} — expand({block: ${b.id}})`)
+              .join("；")}`
+          : "";
       return textResult(
-        `Compressed from "${startName}" to this compress call (${elided} message(s) elided).${absorbed} The summary now replaces that span in your context, right before this compress call.`,
-        { blockId: block.id, elidedMessages: elided, consumedBlockIds: consumed.map((b) => b.id) },
+        `Compressed from "${startName}" to this compress call (${elided} message(s) elided) as block ${block.id}.${absorbedNote} The summary now replaces that span in your context, right before this compress call.${formatProblems(parsed.problems)}`,
+        {
+          blockId: block.id,
+          elidedMessages: elided,
+          absorbedBlockIds: absorbed.map((b) => b.id),
+          problems: parsed.problems,
+        },
       );
+    },
+  };
+}
+
+// ---------------------------------------------------------------------------
+// expand
+// ---------------------------------------------------------------------------
+
+export interface ExpandToolDeps {
+  state: SessionState;
+  logger: Logger;
+  zod: ExtensionAPI["zod"];
+}
+
+/** Render one block in full, plus its own index lines so the model can walk back. */
+function renderExpanded(blocks: CompressionBlock[], block: CompressionBlock): string {
+  const parents = ancestorsOf(blocks, block);
+  const head = `[block ${block.id}「${block.startName}」 — 全文]`;
+  if (parents.length === 0) return `${head}\n${block.summary}`;
+  const index = parents
+    .map((a) => `- 块 ${a.id}「${a.startName}」：${gistOf(a.summary) || "(无摘要)"} — 全文: expand({block: ${a.id}})`)
+    .join("\n");
+  return `${head}\n${block.summary}\n\n更深一层（索引）:\n${index}`;
+}
+
+export function createExpandTool(deps: ExpandToolDeps): ToolDefinition {
+  const { state, logger, zod } = deps;
+  const parameters = zod.object({
+    block: zod.number({ description: "Compression block id, as listed under a newer summary's index lines" }),
+  });
+
+  return {
+    name: "expand",
+    label: "Expand block",
+    description: EXPAND_PROMPT,
+    parameters,
+    async execute(_toolCallId, params, _signal, _onUpdate, _ctx): Promise<ToolResult> {
+      const p = params as { block?: unknown };
+      const id = typeof p.block === "number" ? p.block : Number(p.block);
+      if (!Number.isFinite(id)) throw new Error('expand requires a numeric "block" id');
+      const block = findBlock(state.blocks, id);
+      if (!block) {
+        const known = state.blocks.map((b) => b.id).join(", ") || "(none)";
+        throw new Error(`unknown compression block ${id}. Known blocks: ${known}`);
+      }
+      logger.info("Expanded block", { blockId: id, supersededBy: block.supersededBy });
+      return textResult(renderExpanded(state.blocks, block), { blockId: id, parentIds: block.parentIds });
     },
   };
 }

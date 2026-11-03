@@ -1,9 +1,15 @@
 /**
  * Context transform — applies compression blocks to the LLM-facing message
- * copy on every provider request. Storage is never touched (INV-1: the hook
- * receives a deep clone from hooks.ts).
+ * copy on every provider request. Storage is never touched (the hook receives a
+ * deep clone from hooks.ts).
  *
- * Per block:
+ * Only *live* blocks (supersededBy === null) drive the transform; a block that
+ * was absorbed by a newer one keeps its text in state but no longer elides
+ * anything, because its span already lies inside the newer block's span. Those
+ * ancestors are rendered as one-line index lines, not as full text — the chain
+ * costs O(history) in lines, not in bytes.
+ *
+ * Per live block:
  *   - whole messages in (startMsgIdx, compressMsgIdx) are elided — for
  *     session_start starts, [firstUser+1, compressMsgIdx);
  *   - the start anchor's add_anchor toolCall block and its toolResult message
@@ -14,14 +20,12 @@
  *   - the compress call itself and its toolResult are kept — it is the
  *     implicit end of the span, and the success confirmation staying in
  *     context tells future turns the compression happened;
- *   - the summary is injected right before the compress call's message — it
- *     takes the place of the elided span, and the compress call follows it.
- *     Blocks whose spans don't reach a prior compress call therefore
- *     accumulate summaries in order instead of absorbing them.
+ *   - the summary (plus the ancestor index) is injected right before the
+ *     compress call's message — it takes the place of the elided span.
  *
  * Blocks whose anchors or compress call no longer resolve (fork/compaction
  * residue) are dropped and the state marked dirty so a later flush persists
- * the cleanup.
+ * the cleanup. Superseded blocks are text-only; they are never dropped.
  *
  * Message shape: pi-mono — assistant messages carry toolCall blocks; tool
  * results are standalone toolResult messages keyed by toolCallId.
@@ -30,8 +34,10 @@
 import type { AgentMessage, ContentBlock } from "./omp";
 import type { Logger } from "./logger";
 import type { CompressionBlock, SessionState } from "./state";
+import { ancestorsOf } from "./state";
 import { findToolCallIndex, firstUserMessageIndex, isToolCallBlock } from "./anchors";
-import { SESSION_START_MARKER, formatCompressedSummary } from "./prompts";
+import { SESSION_START_MARKER, formatCompressedSummary, type RenderedBlock } from "./prompts";
+import { gistOf } from "./summary";
 
 interface ResolvedBlock {
   block: CompressionBlock;
@@ -48,6 +54,12 @@ function resolveBlocks(state: SessionState, logger: Logger, messages: AgentMessa
   let dropped = false;
 
   for (const block of state.blocks) {
+    // Absorbed blocks are pure text: their summary is rendered through the
+    // child's index and their span no longer matters.
+    if (block.supersededBy !== null) {
+      survivors.push(block);
+      continue;
+    }
     const hi = findToolCallIndex(messages, block.compressCallId);
     let lo = -1;
     if (block.startToolCallId === null) {
@@ -72,18 +84,28 @@ function resolveBlocks(state: SessionState, logger: Logger, messages: AgentMessa
   return resolved;
 }
 
+/** Summary + ancestor index for one live block. */
+export function renderBlock(blocks: CompressionBlock[], block: CompressionBlock): RenderedBlock {
+  return {
+    startName: block.startName,
+    id: block.id,
+    summary: block.summary,
+    ancestors: ancestorsOf(blocks, block).map((a) => ({ id: a.id, startName: a.startName, gist: gistOf(a.summary) })),
+  };
+}
+
 export function applyCompressions(state: SessionState, logger: Logger, messages: AgentMessage[]): AgentMessage[] {
   const firstUser = firstUserMessageIndex(messages);
   const resolved = resolveBlocks(state, logger, messages);
 
   const elideWhole = new Set<number>();
   const stripIds = new Set<string>();
-  const injectBefore = new Map<number, CompressionBlock[]>();
+  const injectBefore = new Map<number, ResolvedBlock[]>();
   for (const r of resolved) {
     for (let i = r.lo; i < r.hi; i++) elideWhole.add(i);
     if (r.block.startToolCallId !== null) stripIds.add(r.block.startToolCallId);
     const list = injectBefore.get(r.hi) ?? [];
-    list.push(r.block);
+    list.push(r);
     injectBefore.set(r.hi, list);
   }
 
@@ -91,9 +113,9 @@ export function applyCompressions(state: SessionState, logger: Logger, messages:
   const pushInjections = (idx: number): void => {
     const list = injectBefore.get(idx);
     if (!list) return;
-    for (const b of list) {
-      logger.debug("Injected compress summary", { blockId: b.id });
-      out.push(syntheticText(formatCompressedSummary(b.startName, b.summary)));
+    for (const r of list) {
+      logger.debug("Injected compress summary", { blockId: r.block.id, ancestors: r.block.parentIds });
+      out.push(syntheticText(formatCompressedSummary(renderBlock(state.blocks, r.block))));
     }
   };
 

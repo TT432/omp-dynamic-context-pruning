@@ -1,19 +1,28 @@
 /**
  * Session state and persistence.
  *
- * The only durable state is the list of compression blocks. Anchors need no
+ * The only durable state is the set of compression blocks. Anchors need no
  * persistence of their own — they are re-derived by scanning the session
  * history for add_anchor tool calls (tool-call ids are stable across reloads).
  *
- * Persistence rides omp's custom session entries (`dcp-state`, v4): the latest
- * entry on the active branch wins. Older versions (and malformed blocks) are
- * ignored.
+ * Blocks form a **chain**: a compression that absorbs a prior block records it
+ * in `parentIds` and marks the parent `supersededBy`. The parent's text is
+ * never deleted — it stops driving the transform (its span already lies inside
+ * the child's) but stays recallable through `expand`. That is what makes
+ * loss-free merging unnecessary: the model writes the summary it can write, and
+ * whatever it leaves out is still one `expand` away.
+ *
+ * Persistence rides omp's custom session entries (`dcp-state`, v5): the latest
+ * entry on the active branch wins. v4 entries (pre-chain, absorbed blocks
+ * deleted) are migrated with empty `parentIds`; v1–v3 are ignored.
  */
 
 import type { CustomEntry, ExtensionAPI, SessionEntry } from "./omp";
 
 export const PERSIST_TYPE = "dcp-state";
-const PERSIST_VERSION = 4;
+const PERSIST_VERSION = 5;
+/** Oldest version whose block list can be migrated (chain-less but intact). */
+const MIGRATABLE_VERSION = 4;
 
 export interface CompressionBlock {
   id: number;
@@ -28,6 +37,10 @@ export interface CompressionBlock {
    * The call and its toolResult stay in context right after the summary.
    */
   compressCallId: string;
+  /** Blocks this one absorbed, oldest last. Their text stays recallable. */
+  parentIds: number[];
+  /** id of the block that absorbed this one; null while the block is live. */
+  supersededBy: number | null;
   createdAt: number;
 }
 
@@ -37,15 +50,6 @@ export interface SessionState {
   nextBlockId: number;
   /** Timestamp of the latest omp compaction entry seen; blocks die on compaction. */
   lastCompaction: number;
-  /**
-   * Total tool calls visible when the last compression was recorded. The
-   * reminder budget is measured against this watermark instead of scanning for
-   * a compress call in the message stream: calls issued through the eval
-   * kernel (`await tool.write({path:"xd://compress"})`) never appear as a
-   * `write` toolCall block, so a message scan misses them and the counter
-   * never resets.
-   */
-  toolCallMark: number;
   /**
    * Provider-reported token total at the moment of the last compression. That
    * usage report describes the pre-compression context, so until the next
@@ -61,6 +65,13 @@ export interface SessionState {
    * spam. Reset to 0 once the estimate drops back under the threshold.
    */
   remindLevel: number;
+  /**
+   * toolCallId of the `todo` result whose work-unit boundary was already
+   * reported. Without it `[dcp:unit]` repeats on every request until the model
+   * happens to call `todo` again — the newest completed todo result stays
+   * "completed" forever.
+   */
+  unitRemindId: string | null;
   /** Durable divergence from the last persisted dcp-state entry. */
   dirty: boolean;
 }
@@ -71,9 +82,9 @@ export function createSessionState(): SessionState {
     blocks: [],
     nextBlockId: 1,
     lastCompaction: 0,
-    toolCallMark: 0,
     usageMark: 0,
     remindLevel: 0,
+    unitRemindId: null,
     dirty: false,
   };
 }
@@ -84,9 +95,9 @@ export function resetForSession(state: SessionState, sessionId: string): void {
   state.blocks = [];
   state.nextBlockId = 1;
   state.lastCompaction = 0;
-  state.toolCallMark = 0;
   state.usageMark = 0;
   state.remindLevel = 0;
+  state.unitRemindId = null;
   state.dirty = false;
 }
 
@@ -95,9 +106,9 @@ interface SerializedState {
   sessionId: string | null;
   nextBlockId: number;
   blocks: CompressionBlock[];
-  toolCallMark: number;
   usageMark: number;
   remindLevel: number;
+  unitRemindId: string | null;
 }
 
 export function saveSessionState(pi: ExtensionAPI, state: SessionState): void {
@@ -107,9 +118,9 @@ export function saveSessionState(pi: ExtensionAPI, state: SessionState): void {
       sessionId: state.sessionId,
       nextBlockId: state.nextBlockId,
       blocks: state.blocks,
-      toolCallMark: state.toolCallMark,
       usageMark: state.usageMark,
       remindLevel: state.remindLevel,
+      unitRemindId: state.unitRemindId,
     };
     const result = pi.appendEntry(PERSIST_TYPE, data);
     state.dirty = false;
@@ -128,6 +139,7 @@ function isCustomEntry(entry: SessionEntry): entry is CustomEntry {
   return entry.type === "custom";
 }
 
+/** Block shape shared by v4 and v5 (chain fields optional for migration). */
 function isValidBlock(value: unknown): value is CompressionBlock {
   if (typeof value !== "object" || value === null) return false;
   if (!("id" in value) || typeof value.id !== "number") return false;
@@ -136,6 +148,22 @@ function isValidBlock(value: unknown): value is CompressionBlock {
   if (!("summary" in value) || typeof value.summary !== "string") return false;
   if (!("compressCallId" in value) || typeof value.compressCallId !== "string") return false;
   return true;
+}
+
+/** v4 blocks carry no chain fields; a v5 block must declare them. */
+function migrateBlock(value: CompressionBlock, version: number): CompressionBlock {
+  const parents = "parentIds" in value && Array.isArray(value.parentIds) ? value.parentIds.filter((n) => typeof n === "number") : [];
+  const superseded = "supersededBy" in value && (typeof value.supersededBy === "number" || value.supersededBy === null) ? value.supersededBy : null;
+  return {
+    id: value.id,
+    startName: value.startName,
+    startToolCallId: value.startToolCallId,
+    summary: value.summary,
+    compressCallId: value.compressCallId,
+    parentIds: version >= PERSIST_VERSION ? parents : [],
+    supersededBy: version >= PERSIST_VERSION ? superseded : null,
+    createdAt: typeof value.createdAt === "number" ? value.createdAt : 0,
+  };
 }
 
 /**
@@ -151,21 +179,60 @@ export function loadSessionState(entries: SessionEntry[], state: SessionState): 
 
   const data: unknown = latest.data;
   if (typeof data !== "object" || data === null) return false;
-  if (!("v" in data) || data.v !== PERSIST_VERSION) return false;
+  if (!("v" in data) || typeof data.v !== "number") return false;
+  if (data.v !== PERSIST_VERSION && data.v !== MIGRATABLE_VERSION) return false;
   if (!("blocks" in data) || !Array.isArray(data.blocks)) return false;
 
-  const blocks = data.blocks.filter(isValidBlock);
+  const version = data.v;
+  const blocks = (data.blocks as unknown[]).filter(isValidBlock).map((b) => migrateBlock(b, version));
   state.blocks = blocks;
   const maxId = blocks.reduce((max, b) => Math.max(max, b.id), 0);
   state.nextBlockId =
     "nextBlockId" in data && typeof data.nextBlockId === "number" && data.nextBlockId > maxId
       ? data.nextBlockId
       : maxId + 1;
-  state.toolCallMark =
-    "toolCallMark" in data && typeof data.toolCallMark === "number" && data.toolCallMark >= 0 ? data.toolCallMark : 0;
   state.usageMark = "usageMark" in data && typeof data.usageMark === "number" && data.usageMark >= 0 ? data.usageMark : 0;
   state.remindLevel =
     "remindLevel" in data && typeof data.remindLevel === "number" && data.remindLevel >= 0 ? data.remindLevel : 0;
+  state.unitRemindId =
+    "unitRemindId" in data && typeof data.unitRemindId === "string" && data.unitRemindId.length > 0
+      ? data.unitRemindId
+      : null;
   state.dirty = false;
   return true;
+}
+
+// ---------------------------------------------------------------------------
+// chain helpers
+// ---------------------------------------------------------------------------
+
+/** Live (not superseded) blocks, in creation order. */
+export function activeBlocks(blocks: CompressionBlock[]): CompressionBlock[] {
+  return blocks.filter((b) => b.supersededBy === null);
+}
+
+/** Block by id, or undefined. */
+export function findBlock(blocks: CompressionBlock[], id: number): CompressionBlock | undefined {
+  return blocks.find((b) => b.id === id);
+}
+
+/**
+ * Full ancestry of a block, nearest parent first. Cycles are impossible by
+ * construction (a parent always has a smaller id) but the traversal still
+ * guards against corrupt state.
+ */
+export function ancestorsOf(blocks: CompressionBlock[], block: CompressionBlock): CompressionBlock[] {
+  const out: CompressionBlock[] = [];
+  const seen = new Set<number>([block.id]);
+  let frontier = [...block.parentIds].reverse();
+  while (frontier.length > 0) {
+    const id = frontier.shift()!;
+    if (seen.has(id)) continue;
+    seen.add(id);
+    const parent = findBlock(blocks, id);
+    if (!parent) continue;
+    out.push(parent);
+    frontier = [...parent.parentIds].reverse().concat(frontier);
+  }
+  return out;
 }

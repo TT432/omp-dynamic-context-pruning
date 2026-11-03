@@ -2,10 +2,13 @@
  * DCP for omp — anchor-based conversation compression.
  *
  * Default-exported factory; omp loads this module and calls it with the live
- * `ExtensionAPI`. Two tools are registered:
+ * `ExtensionAPI`. Three tools are registered:
  *   - add_anchor: place a named anchor at the call site;
  *   - compress:   replace the span from an anchor up to the compress call
- *                 itself with a model-authored summary (start anchor consumed).
+ *                 itself with a model-authored summary (start anchor consumed;
+ *                 absorbed blocks stay recallable in the block chain);
+ *   - expand:     pull back the full text of a block that is currently only an
+ *                 index line under a newer summary.
  * The context handler applies compression blocks to the outgoing message copy
  * on every LLM request. Session storage is never modified.
  */
@@ -21,7 +24,7 @@ import {
   createSessionStartHandler,
   createSessionSwitchHandler,
 } from "./src/hooks";
-import { createAddAnchorTool, createCompressTool } from "./src/tools";
+import { createAddAnchorTool, createCompressTool, createExpandTool } from "./src/tools";
 import { parseRemindPolicy } from "./src/remind";
 
 export default function dcpExtension(pi: ExtensionAPI): void {
@@ -30,8 +33,6 @@ export default function dcpExtension(pi: ExtensionAPI): void {
 
   // DCP_REMIND_THRESHOLD: (0,1) = fraction of the context window (default 0.4),
   // >=1 = absolute tokens, <=0 disables the token trigger.
-  // DCP_REMIND_TOOLCALLS: tool calls since the last compress before nudging
-  // (default 40), <=0 disables the tool-call trigger.
   const remind = parseRemindPolicy(typeof process !== "undefined" ? process.env : {});
 
   const state = createSessionState();
@@ -59,6 +60,8 @@ export default function dcpExtension(pi: ExtensionAPI): void {
       },
     }),
   );
+
+  pi.registerTool(createExpandTool({ state, logger, zod: pi.zod }));
 
   logger.info("DCP initialized (anchor mode)");
 }

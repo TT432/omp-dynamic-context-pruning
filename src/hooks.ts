@@ -32,7 +32,7 @@ export interface HandlerDeps {
   state: SessionState;
   logger: Logger;
   pi: ExtensionAPI;
-  /** When to nudge the model to compress (token budget, tool-call budget). */
+  /** When to nudge the model to compress (token budget). */
   remind: RemindPolicy;
 }
 
@@ -153,14 +153,7 @@ export function createContextHandler(deps: HandlerDeps) {
 
     const messages = cloneMessages(event.messages ?? []);
     const transformed = applyCompressions(deps.state, deps.logger, messages);
-    const outgoing = maybeAppendReminder(
-      transformed,
-      ctx,
-      deps.remind,
-      deps.state.toolCallMark,
-      deps.state.usageMark,
-      deps.state,
-    );
+    const outgoing = maybeAppendReminder(transformed, ctx, deps.remind, deps.state.usageMark, deps.state);
     deps.logger.saveContext(deps.state.sessionId ?? "session", outgoing);
     return { messages: outgoing };
   };

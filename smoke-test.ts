@@ -8,13 +8,15 @@
  *
  * compress semantics under test: compress(startAnchor, summary) elides the
  * span from the anchor up to the compress call itself — the end is implicit,
- * there is no endAnchor.
+ * there is no endAnchor. Absorbed blocks form a chain: their text stays in
+ * state, renders as an index line, and comes back in full through `expand`.
+ * Nothing about a summary is rejected; shape problems ride the result.
  *
  * Run: bun smoke-test.ts
  */
 import { scanAnchors, firstUserMessageIndex } from "./src/anchors";
-import { applyCompressions } from "./src/transform";
-import { createAddAnchorTool, createCompressTool, branchMessages } from "./src/tools";
+import { applyCompressions, renderBlock } from "./src/transform";
+import { createAddAnchorTool, createCompressTool, createExpandTool, branchMessages } from "./src/tools";
 import {
   createSessionState,
   saveSessionState,
@@ -28,7 +30,17 @@ import {
   resolveSessionId,
   type HandlerDeps,
 } from "./src/hooks";
-import { estimateContextTokens, maybeAppendReminder, REMIND_MARKER, UNIT_MARKER, BUDGET_MARKER, parseRemindPolicy, DEFAULT_TOKEN_THRESHOLD, DEFAULT_TOOLCALL_BUDGET, toolCallsSinceLastCompress, countToolCalls, tokenBracket, finishedTodoSet } from "./src/remind";
+import {
+  estimateContextTokens,
+  maybeAppendReminder,
+  REMIND_MARKER,
+  UNIT_MARKER,
+  parseRemindPolicy,
+  DEFAULT_TOKEN_THRESHOLD,
+  tokenBracket,
+  finishedTodoSet,
+  type RemindCursor,
+} from "./src/remind";
 import { Logger } from "./src/logger";
 import { parseSummary } from "./src/summary";
 import type { AgentMessage, ExtensionAPI, ExtensionContext, SessionEntry, ToolDefinition, ToolResult } from "./src/omp";
@@ -43,9 +55,9 @@ function assert(cond: boolean, msg: string): void {
     console.log("ok:", msg);
   }
 }
-/** Reminder policy with only the token trigger active (unit/budget disabled). */
+/** Reminder policy with only the token trigger active. */
 function tok(tokenThreshold: number) {
-  return { tokenThreshold, toolCallBudget: 0 };
+  return { tokenThreshold };
 }
 const REMIND_OFF = tok(0);
 
@@ -96,10 +108,10 @@ function firstText(message: AgentMessage): string {
   return typeof block.text === "string" ? block.text : "";
 }
 
-/** Canonical slot order of the summary schema (mirrors src/summary.ts). */
+/** Recommended slot order of the summary shape (mirrors src/summary.ts). */
 const SLOTS = ["当前任务", "已完成", "未完成", "约束", "文件与命令", "在跑作业与句柄"];
 
-/** A valid slot-structured summary; `marker` lands in every slot's fact. */
+/** A slot-structured summary; `marker` lands in every slot's fact. */
 function sum(marker: string, overrides: Partial<Record<string, string>> = {}): string {
   const fact = (slot: string) => overrides[slot] ?? `${marker} — ${slot}`;
   return SLOTS.map((slot) => `## ${slot}\n- ${fact(slot)} 证据: smoke-test.ts:1`).join("\n");
@@ -249,6 +261,7 @@ const compressTool = createCompressTool({
   const ctx = makeCtx(convo().slice(0, 3));
   const res = await addAnchorTool.execute("tu_new", { anchor: "fresh" }, undefined, undefined, ctx);
   assert(textOf(res).includes('Anchor "fresh" recorded'), "add_anchor confirms with the anchor name");
+  assert(textOf(res).includes("NEXT span"), "add_anchor states that the anchor marks the next span's start");
 
   await assertThrows(
     () => addAnchorTool.execute("tu_other", { anchor: "a1" }, undefined, undefined, makeCtx(convo())),
@@ -298,10 +311,12 @@ const compressTool = createCompressTool({
     "block stores the start anchor, its tool-call id, and the compress call id (no end anchor)",
   );
   assert(!("endName" in b) && !("endToolCallId" in b), "block carries no end-anchor fields");
+  assert(b.parentIds.length === 0 && b.supersededBy === null, "first block is a chain root and stays live");
   assert(state.dirty === false, "compress persists immediately (dirty cleared)");
   assert(appended.length === before + 1 && appended[before].customType === PERSIST_TYPE, "compress appended a dcp-state entry");
   assert(textOf(res).includes('Compressed from "a1" to this compress call'), "compress result confirms the range");
   assert(textOf(res).includes("5 message(s) elided"), "elided count spans from after the anchor to the compress call");
+  assert(!textOf(res).includes("摘要形状提示"), "a well-shaped summary produces no advisory");
 
   // same result when the in-flight call IS already on the branch
   const s3b = createSessionState();
@@ -321,6 +336,7 @@ const compressTool = createCompressTool({
   assert(!render.includes("Feature X done."), "span tail elided — the span runs up to the compress call");
   assert(!render.includes('Anchor \\"a1\\" recorded'), "start anchor toolResult elided");
   assert(render.includes("[Compressed: a1 → here]") && render.includes("D1: built feature X"), "summary injected with header");
+  assert(render.includes("(block 1)"), "injected header names the block id (expand target)");
   assert(render.includes("tu_c1"), "compress call kept in context (it is the implicit end)");
   assert(JSON.stringify(out[4]).includes("[Compressed: a1 → here]"), "summary takes the place of the elided span");
   assert(JSON.stringify(out[5]).includes("tu_c1") && JSON.stringify(out[6]).includes("tu_c1"), "compress call and its confirmation follow the summary");
@@ -349,6 +365,7 @@ const compressTool = createCompressTool({
     makeCtx(extended.slice(0, 15)),
   );
   assert(state.blocks.length === 2 && state.blocks[0].id === 1 && state.blocks[1].id === 2, "second compress keeps the earlier block — summaries accumulate");
+  assert(state.blocks[0].supersededBy === null, "an out-of-span block is not absorbed");
   assert(!textOf(res).includes("Absorbed"), "accumulation absorbs nothing");
 
   // out = [prompt, MARKER, msg1, msg2, SUMMARY1, msg9, msg10, msg11, msg12, SUMMARY2, msg15, msg16]
@@ -360,6 +377,7 @@ const compressTool = createCompressTool({
   assert(render.includes("D1: built feature X"), "earlier summary stays in place");
   assert(render.includes("D2: phase two"), "new summary injected");
   assert(render.indexOf("D1: built feature X") < render.indexOf("D2: phase two"), "summaries accumulate in order");
+  assert(!render.includes("已并入本块"), "no chain index when nothing was absorbed");
   assert(render.includes("tu_c1"), "earlier compress call kept — it sits before the new span");
   assert(render.includes("Second phase."), "work between the two compressions kept");
   assert(!render.includes("tu_a2"), "new start anchor stripped (consumed)");
@@ -368,7 +386,8 @@ const compressTool = createCompressTool({
 }
 
 // ---------------------------------------------------------------------------
-// 5. session_start as start anchor
+// 5. session_start as start anchor (no confirmation flag — absorbed blocks stay
+//    recallable, so the full wipe is no longer unrecoverable)
 // ---------------------------------------------------------------------------
 {
   const s2 = createSessionState();
@@ -382,7 +401,7 @@ const compressTool = createCompressTool({
     { role: "assistant", content: [tu("tu_c3", "compress", { startAnchor: "session_start", summary: "DS" })] },
     tres("tu_c3", "compress", "ok"),
   ];
-  await tool2.execute("tu_c3", { startAnchor: "session_start", summary: sum("DS: early exploration done."), force: true }, undefined, undefined, makeCtx(mini.slice(0, 5)));
+  await tool2.execute("tu_c3", { startAnchor: "session_start", summary: sum("DS: early exploration done.") }, undefined, undefined, makeCtx(mini.slice(0, 5)));
   assert(s2.blocks.length === 1 && s2.blocks[0].startToolCallId === null, "session_start block stores a null startToolCallId");
 
   // out = [prompt, MARKER, SUMMARY, compress(tu_c3), tr_c3]
@@ -398,100 +417,67 @@ const compressTool = createCompressTool({
 }
 
 // ---------------------------------------------------------------------------
-// 6. validation errors (INV-4: state unchanged on failure)
+// 6. nothing about a summary is rejected: shape problems are advisory and the
+//    compression still applies. Only meaningless calls throw (unknown anchor,
+//    empty span, empty summary) — each of those leaves state untouched.
 // ---------------------------------------------------------------------------
 {
-  const s3 = createSessionState();
-  const tool3 = createCompressTool({ state: s3, logger, zod: zodStub, persist: () => {} });
+  const mk = () => {
+    const st = createSessionState();
+    return { st, tool: createCompressTool({ state: st, logger, zod: zodStub, persist: () => {} }) };
+  };
   const ctx = makeCtx(convo().slice(0, 9));
 
+  // preconditions still throw
   await assertThrows(
-    () => tool3.execute("tu_e1", { startAnchor: "nope", summary: sum("x") }, undefined, undefined, ctx),
+    () => mk().tool.execute("tu_e1", { startAnchor: "nope", summary: sum("x") }, undefined, undefined, ctx),
     /unknown startAnchor "nope".*session_start/s,
-    "unknown startAnchor rejected, available anchors listed",
+    "unknown startAnchor throws, available anchors listed",
   );
   await assertThrows(
-    () => tool3.execute("tu_e2", { startAnchor: "a1", summary: "  " }, undefined, undefined, ctx),
+    () => mk().tool.execute("tu_e2", { startAnchor: "a1", summary: "  " }, undefined, undefined, ctx),
     /non-empty string "summary"/,
-    "empty summary rejected",
+    "empty summary throws",
   );
-
-  // empty range: the anchor call is the last thing before the compress call
   const adjacent: AgentMessage[] = [
     { role: "user", content: [txt("p")] },
     { role: "assistant", content: [anchorCall("tu_p1", "p1")] },
   ];
   await assertThrows(
-    () => tool3.execute("tu_e3", { startAnchor: "p1", summary: sum("x") }, undefined, undefined, makeCtx(adjacent)),
+    () => mk().tool.execute("tu_e3", { startAnchor: "p1", summary: sum("x") }, undefined, undefined, makeCtx(adjacent)),
     /contains no messages/,
-    "empty range rejected (anchor immediately precedes the compress call)",
+    "empty range throws (anchor immediately precedes the compress call)",
   );
-  await assertThrows(
-    () => tool3.execute("tu_e4", { startAnchor: "session_start", summary: "x" }, undefined, undefined, ctx),
-    /force=true/,
-    "session_start compression without force is rejected (amnesia guard)",
-  );
-  assert(s3.blocks.length === 0, "failed compresses record no blocks");
 
-  // start anchor inside an active compression → reject; reaching back across
-  // a prior compression from an earlier anchor → absorb
-  const s4 = createSessionState();
-  const pi4 = makePi([]);
-  const tool4 = createCompressTool({ state: s4, logger, zod: zodStub, persist: () => saveSessionState(pi4, s4) });
-  const FIRST = sum("first half");
-  const EVERYTHING = sum("everything so far");
-  const wide: AgentMessage[] = [
-    { role: "user", content: [txt("p")] },
-    { role: "assistant", content: [anchorCall("tu_q1", "q1")] },
-    tres("tu_q1", "add_anchor", "1"),
-    { role: "assistant", content: [txt("mid1"), tu("tu_m1", "bash", { command: "ls" })] },
-    tres("tu_m1", "bash", "files"),
-    { role: "assistant", content: [anchorCall("tu_q2", "q2")] },
-    tres("tu_q2", "add_anchor", "2"),
-    { role: "assistant", content: [tu("tu_c1", "compress", { startAnchor: "q1", summary: "first" })] },
-    tres("tu_c1", "compress", "ok"),
-    { role: "assistant", content: [txt("later work"), tu("tu_m2", "bash", { command: "test" })] },
-    tres("tu_m2", "bash", "pass"),
-    { role: "assistant", content: [tu("tu_c2", "compress", { startAnchor: "q2", summary: "x" })] },
-    tres("tu_c2", "compress", "ok"),
-  ];
-  await tool4.execute("tu_c1", { startAnchor: "q1", summary: FIRST }, undefined, undefined, makeCtx(wide.slice(0, 7)));
-  assert(s4.blocks.length === 1, "setup block recorded");
-  await assertThrows(
-    () => tool4.execute("tu_c2", { startAnchor: "q2", summary: sum("x") }, undefined, undefined, makeCtx(wide.slice(0, 11))),
-    /lies inside the active compression.*q1/s,
-    "start anchor inside an active compression rejected (its span would be half-elided)",
-  );
-  assert(s4.blocks.length === 1 && s4.blocks[0].summary === FIRST, "rejection leaves existing blocks untouched");
+  // a shape-less prose summary compresses anyway, with the advisory attached
+  {
+    const { st, tool } = mk();
+    const prose = "先做了摸底，然后改了 x.ts，测试通过，下一步跑 1.20.1。";
+    const res = await tool.execute("tu_c1", { startAnchor: "a1", summary: prose }, undefined, undefined, ctx);
+    assert(st.blocks.length === 1 && st.blocks[0].summary === prose, "free-form summary is applied, not rejected");
+    assert(textOf(res).includes("摘要形状提示"), "advisory names the shape deviation");
+    assert(textOf(res).includes("当前任务"), "advisory restates the recommended slots");
+    assert(st.nextBlockId === 2, "block id counter advanced");
+  }
 
-  // absorption: compress from an earlier anchor reaching across the prior block
-  const res = await tool4.execute(
-    "tu_c3",
-    { startAnchor: "session_start", summary: EVERYTHING, force: true },
-    undefined,
-    undefined,
-    makeCtx(wide.slice(0, 11)),
-  );
-  assert(s4.blocks.length === 1 && s4.blocks[0].summary === EVERYTHING, "prior block fully contained → absorbed into the new summary");
-  assert(textOf(res).includes("Absorbed 1 prior compression"), "absorption reported in the result");
-
-  // transform of the absorbing block: the old compress pair is elided too
-  const withC3: AgentMessage[] = [
-    ...wide,
-    { role: "assistant", content: [tu("tu_c3", "compress", { startAnchor: "session_start", summary: "everything so far" })] },
-    tres("tu_c3", "compress", "ok"),
-  ];
-  const out = applyCompressions(s4, logger, clone(withC3));
-  const render = JSON.stringify(out);
-  assert(render.includes("everything so far"), "absorbing summary injected");
-  assert(!render.includes("first half"), "absorbed summary never injected");
-  assert(!render.includes("tu_c1"), "absorbed block's compress call elided with the span");
-  assert(!render.includes("mid1") && !render.includes("later work"), "whole span elided");
-  assert(render.includes("tu_c3"), "absorbing compress call kept");
+  // a summary with a broken slot header still applies and still renders
+  {
+    const { st, tool } = mk();
+    const res = await tool.execute(
+      "tu_c1",
+      { startAnchor: "a1", summary: "## 任务（本轮）\n- 改 x.ts 证据: x.ts:1\n## 已完成\n- 做完 证据: x.ts:2" },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert(st.blocks.length === 1, "unknown slot header does not block the compress");
+    assert(textOf(res).includes("不在建议列表"), "advisory reports the unknown slot");
+    assert(renderBlock(st.blocks, st.blocks[0]).summary.includes("## 任务（本轮）"), "the model's own headers are preserved verbatim");
+  }
 }
 
 // ---------------------------------------------------------------------------
-// 7. persistence round trip (v4) + older versions ignored
+// 7. persistence round trip (v5 chain fields) + v4 migration + older ignored
 // ---------------------------------------------------------------------------
 {
   const s5 = createSessionState();
@@ -502,10 +488,13 @@ const compressTool = createCompressTool({
     startToolCallId: "tu_a1",
     summary: "S",
     compressCallId: "tu_c",
+    parentIds: [5, 4],
+    supersededBy: 8,
     createdAt: 123,
   });
   s5.nextBlockId = 8;
-  s5.toolCallMark = 42;
+  s5.usageMark = 900;
+  s5.unitRemindId = "tu_todo7";
   s5.dirty = true;
   const app: { customType: string; data: unknown }[] = [];
   saveSessionState(makePi(app), s5);
@@ -518,14 +507,39 @@ const compressTool = createCompressTool({
   const loaded = loadSessionState(branch, s6);
   assert(loaded && s6.blocks.length === 1 && s6.blocks[0].id === 7 && s6.blocks[0].compressCallId === "tu_c", "round trip restores the block");
   assert(s6.nextBlockId === 8, "nextBlockId restored");
-  assert(s6.toolCallMark === 42, "toolCallMark restored from the durable state");
+  assert(s6.blocks[0].parentIds.join(",") === "5,4" && s6.blocks[0].supersededBy === 8, "chain fields survive the round trip");
+  assert(s6.usageMark === 900 && s6.unitRemindId === "tu_todo7", "reminder watermarks survive the round trip");
+  assert(!("toolCallMark" in (app[0].data as Record<string, unknown>)), "the tool-call counter is gone from the persisted shape");
+
+  // v4 (pre-chain) entries migrate: absorbed parents were already deleted, so
+  // they come back as chain roots instead of being discarded
+  const v4: SessionEntry[] = [
+    {
+      type: "custom",
+      id: "c2",
+      parentId: null,
+      timestamp: new Date().toISOString(),
+      customType: PERSIST_TYPE,
+      data: {
+        v: 4,
+        sessionId: "sess-old",
+        nextBlockId: 9,
+        blocks: [{ id: 8, startName: "session_start", startToolCallId: null, summary: "old", compressCallId: "tu_old", createdAt: 5 }],
+        usageMark: 0,
+        remindLevel: 0,
+      },
+    },
+  ];
+  const s7 = createSessionState();
+  assert(loadSessionState(v4, s7) === true && s7.blocks.length === 1, "v4 entry is migrated");
+  assert(s7.blocks[0].parentIds.length === 0 && s7.blocks[0].supersededBy === null, "v4 block becomes a chain root");
 
   for (const v of [1, 2, 3]) {
     const oldBranch: SessionEntry[] = [
-      { type: "custom", id: "c2", parentId: null, timestamp: new Date().toISOString(), customType: PERSIST_TYPE, data: { v, maps: {} } },
+      { type: "custom", id: "c3", parentId: null, timestamp: new Date().toISOString(), customType: PERSIST_TYPE, data: { v, maps: {} } },
     ];
-    const s7 = createSessionState();
-    assert(loadSessionState(oldBranch, s7) === false && s7.blocks.length === 0, `v${v} entries are ignored`);
+    const s8 = createSessionState();
+    assert(loadSessionState(oldBranch, s8) === false && s8.blocks.length === 0, `v${v} entries are ignored`);
   }
 }
 
@@ -542,7 +556,7 @@ const compressTool = createCompressTool({
   seeded.sessionId = "sess-life";
   seeded.blocks.push({
     id: 3, startName: "a", startToolCallId: "tu_a",
-    summary: "seed", compressCallId: "tu_c", createdAt: 1,
+    summary: "seed", compressCallId: "tu_c", parentIds: [], supersededBy: null, createdAt: 1,
   });
   seeded.nextBlockId = 4;
   seeded.dirty = true;
@@ -591,15 +605,24 @@ const compressTool = createCompressTool({
   assert(render.includes("[anchor: session_start") && render.includes("D1 again.") && !render.includes("Working on feature X."), "context handler returns the transformed conversation");
   assert(s9.sessionId !== null, "context handler lazy-binds the session");
 
-  // orphan: block whose compress call no longer exists gets dropped + dirty
+  // orphan: live block whose compress call no longer exists is dropped + dirty
   s9.blocks.push({
     id: 99, startName: "ghost", startToolCallId: "tu_g1",
-    summary: "ghost", compressCallId: "tu_gone", createdAt: 0,
+    summary: "ghost", compressCallId: "tu_gone", parentIds: [], supersededBy: null, createdAt: 0,
   });
   s9.dirty = false;
   const out2 = applyCompressions(s9, logger, clone(msgs));
   assert(s9.blocks.length === 1 && (s9.dirty as boolean) === true, "orphan block dropped at transform time and marked dirty");
   assert(!JSON.stringify(out2).includes("ghost"), "orphan summary never injected");
+
+  // a superseded block is text-only: it survives even when its own anchors are
+  // gone, because expand still has to be able to return it
+  s9.blocks.push({
+    id: 100, startName: "dead", startToolCallId: "tu_d", summary: "kept text",
+    compressCallId: "tu_c1", parentIds: [], supersededBy: 1, createdAt: 0,
+  });
+  applyCompressions(s9, logger, clone(msgs));
+  assert(s9.blocks.some((b) => b.id === 100), "absorbed block keeps its text despite unresolvable anchors");
 }
 
 // ---------------------------------------------------------------------------
@@ -621,7 +644,7 @@ const compressTool = createCompressTool({
   // the exact reported flow: compress right after the anchor was added
   const res = await tool10.execute(
     "tu_c9",
-    { startAnchor: "session_start", summary: sum("S:摸底完成。"), force: true },
+    { startAnchor: "session_start", summary: sum("S:摸底完成。") },
     undefined,
     undefined,
     makeCtx(live.slice(0, 5)),
@@ -669,7 +692,7 @@ const compressTool = createCompressTool({
   assert(render.includes("S: done."), "summary injected");
   // every surviving toolCall has its toolResult in the output
   const ids = [...render.matchAll(/"id":"(t_[a-z])"/g)].map((m) => m[1]);
-  assert(ids.every((id) => render.includes(`"toolCallId\":\"${id}\"`) || render.includes(`"toolCallId":"${id}"`)), "no dangling toolCall without a toolResult");
+  assert(ids.every((id) => render.includes(`"toolCallId\":\"${id}"`) || render.includes(`"toolCallId":"${id}"`)), "no dangling toolCall without a toolResult");
 }
 
 // ---------------------------------------------------------------------------
@@ -738,6 +761,7 @@ const compressTool = createCompressTool({
   assert(out14.length === hot.length + 1 && last14.role === "user", "reminder appended as a trailing user message over threshold");
   assert(lastText.includes(REMIND_MARKER) && lastText.includes("900"), "reminder reports the estimated tokens");
   assert(lastText.includes('"a1"') && lastText.includes('"session_start"'), "reminder lists the available anchors");
+  assert(!/force=true|strict summary tier/.test(lastText), "reminder no longer demands the removed gates");
 
   // under threshold → same reference back, nothing appended
   const cool = [...convo(), used(500)];
@@ -758,6 +782,9 @@ const compressTool = createCompressTool({
   const bigText: AgentMessage[] = [{ role: "user", content: [txt("y".repeat(4000))] }];
   assert(estimateContextTokens(bigText) === 1000, "estimate falls back to the chars/4 heuristic without usage");
   assert(maybeAppendReminder(bigText, withWindow(bigText, 1000), tok(0.8)).length === 2, "heuristic estimate can trigger the reminder");
+  // CJK text tokenizes denser than ASCII: the same character count costs more
+  const cjkText: AgentMessage[] = [{ role: "user", content: [txt("字".repeat(4000))] }];
+  assert(estimateContextTokens(cjkText) === 2000, "CJK characters are counted at ~2 chars/token, not 4");
 
   // end-to-end through the context handler: reminder in the outgoing copy only
   const s14 = createSessionState();
@@ -769,315 +796,174 @@ const compressTool = createCompressTool({
 }
 
 // ---------------------------------------------------------------------------
-// 15. work-unit and tool-call-budget reminders
+// 15. work-unit boundary reminder: fires once per finished todo set, on every
+//     host wording, and never twice for the same result. The tool-call budget
+//     is gone — a call count is not a context cost (session 01a19fdd compressed
+//     at 40 calls, three minutes in, and re-read three files right after).
 // ---------------------------------------------------------------------------
 {
-  const win = (msgs: AgentMessage[], contextWindow: number): ExtensionContext => ({
+  const win = (msgs: AgentMessage[], contextWindow = 100000): ExtensionContext => ({
     ...makeCtx(msgs),
     model: { id: "m", contextWindow },
   });
-  const used = (totalTokens: number): AgentMessage => ({
-    role: "assistant",
-    content: [txt("turn done.")],
-    usage: { input: totalTokens, output: 0, totalTokens },
-  });
-  const budgetPolicy = { tokenThreshold: 0, toolCallBudget: 40 };
-  const ctx0 = win(convo(), 1000);
-
-  // policy parsing: defaults + env overrides
-  assert(DEFAULT_TOKEN_THRESHOLD === 0.4 && parseRemindPolicy({}).tokenThreshold === 0.4, "default token threshold is 0.4");
-  assert(DEFAULT_TOOLCALL_BUDGET === 40 && parseRemindPolicy({}).toolCallBudget === 40, "default tool-call budget is 40");
-  assert(parseRemindPolicy({ DCP_REMIND_THRESHOLD: "0.7" }).tokenThreshold === 0.7, "env overrides the token threshold");
-  assert(parseRemindPolicy({ DCP_REMIND_TOOLCALLS: "12" }).toolCallBudget === 12, "env overrides the tool-call budget");
-  assert(parseRemindPolicy({ DCP_REMIND_TOOLCALLS: "0" }).toolCallBudget === 0, "0 disables the tool-call budget");
-  assert(parseRemindPolicy({ DCP_REMIND_THRESHOLD: "abc" }).tokenThreshold === DEFAULT_TOKEN_THRESHOLD, "garbage env falls back to the default");
-
-  // unit boundary: the newest todo result reports a completed set
-  const done: AgentMessage[] = [
+  const withTodo = (text: string): AgentMessage[] => [
     ...convo(),
     { role: "assistant", content: [tu("td", "todo", { op: "done" })] },
-    tres("td", "todo", "All items complete"),
+    tres("td", "todo", text),
   ];
-  assert(finishedTodoSet(done) !== null, "completed todo set detected");
-  const unitOut = maybeAppendReminder(done, ctx0, budgetPolicy);
-  const unitLast = unitOut[unitOut.length - 1];
-  const unitText = firstText(unitLast);
-  assert(unitOut.length === done.length + 1 && unitText.includes(UNIT_MARKER), "todo completion appends the unit reminder");
-  assert(unitText.includes('"a1"'), "unit reminder lists the available anchors");
+  const cursor = (): RemindCursor => ({ remindLevel: 0, unitRemindId: null });
 
-  // mid-progress todo set is not a boundary
-  const wip: AgentMessage[] = [
-    ...convo(),
-    { role: "assistant", content: [tu("tw", "todo", { op: "done" })] },
-    tres("tw", "todo", "Remaining items (2):"),
-  ];
+  // every finished-set wording the host has emitted
+  for (const wording of ["All items complete", "Remaining items (0)", "Remaining items: none.\nOverall: 4/4 done, 0 open."]) {
+    const msgs = withTodo(wording);
+    assert(finishedTodoSet(msgs) !== null, `finished todo set detected: ${wording.slice(0, 24)}`);
+    const out = maybeAppendReminder(msgs, win(msgs), REMIND_OFF, 0, cursor());
+    const text = firstText(out[out.length - 1]);
+    assert(out.length === msgs.length + 1 && text.includes(UNIT_MARKER), `unit reminder appended: ${wording.slice(0, 24)}`);
+    assert(text.includes('"a1"'), "unit reminder lists the available anchors");
+    assert(!/force=true/.test(text), "unit reminder no longer demands force");
+  }
+
+  // mid-progress todo sets are not boundaries
+  const wip = withTodo("Remaining items (2):\n- build\n- ship");
   assert(finishedTodoSet(wip) === null, "mid-progress todo set is not a boundary");
-  assert(maybeAppendReminder(wip, ctx0, budgetPolicy) === wip, "no unit reminder while the todo set is in progress");
+  assert(maybeAppendReminder(wip, win(wip), REMIND_OFF, 0, cursor()) === wip, "no unit reminder while the todo set is in progress");
 
-  // tool-call budget, reset by compress
-  const calls = (n: number): AgentMessage[] => [
-    { role: "user", content: [txt("go")] },
-    { role: "assistant", content: Array.from({ length: n }, (_, i) => tu(`c${i}`, "bash", { command: "x" })) },
-  ];
-  assert(toolCallsSinceLastCompress(calls(39)) === 39, "counts tool calls since the start");
-  assert(countToolCalls(convo()) === 5, "countToolCalls counts every toolCall block in the stream");
-  assert(toolCallsSinceLastCompress(convo(), countToolCalls(convo())) === 0, "watermark resets the count");
-  assert(toolCallsSinceLastCompress(convo(), countToolCalls(convo()) + 10) === 0, "a watermark ahead of the stream never goes negative");
-  const under = calls(39);
-  assert(maybeAppendReminder(under, ctx0, budgetPolicy) === under, "no budget reminder under the budget");
-  const at = calls(40);
-  const atOut = maybeAppendReminder(at, ctx0, budgetPolicy);
-  assert(atOut.length === at.length + 1 && JSON.stringify(atOut[atOut.length - 1]).includes(BUDGET_MARKER), "budget reminder fires at the budget");
-  assert(maybeAppendReminder(at, ctx0, { tokenThreshold: 0, toolCallBudget: 0 }) === at, "budget 0 disables the tool-call trigger");
+  // dedupe: the same finished result never reminds twice
+  const done = withTodo("Remaining items: none.");
+  const c1 = cursor();
+  const first = maybeAppendReminder(done, win(done), REMIND_OFF, 0, c1);
+  assert(first.length === done.length + 1 && c1.unitRemindId === "td", "first sighting reports and records the watermark");
+  assert(maybeAppendReminder(done, win(done), REMIND_OFF, 0, c1) === done, "same finished todo result stays silent");
+  // a new finished result reports again
+  const done2: AgentMessage[] = [...done, { role: "assistant", content: [tu("td2", "todo", { op: "done" })] }, tres("td2", "todo", "All items complete")];
+  assert(maybeAppendReminder(done2, win(done2), REMIND_OFF, 0, c1).length === done2.length + 1, "a new finished result reports again");
 
   // one reminder per request; token pressure outranks the unit boundary
-  const hotDone = [...done, used(900)];
-  const hotOut = maybeAppendReminder(hotDone, win(hotDone, 1000), { tokenThreshold: 0.8, toolCallBudget: 1 });
+  const hotDone = [...done, { role: "assistant", content: [txt("turn")], usage: { input: 900, output: 0, totalTokens: 900 } }];
+  const hotOut = maybeAppendReminder(hotDone, { ...makeCtx(hotDone), model: { id: "m", contextWindow: 1000 } }, tok(0.8), 0, cursor());
   assert(hotOut.length === hotDone.length + 1, "exactly one reminder per request");
-  assert(JSON.stringify(hotOut[hotOut.length - 1]).includes(REMIND_MARKER), "token pressure outranks the unit boundary");
+  assert(firstText(hotOut[hotOut.length - 1]).includes(REMIND_MARKER), "token pressure outranks the unit boundary");
+
+  // the counter's env var is inert now
+  assert(!("toolCallBudget" in parseRemindPolicy({ DCP_REMIND_TOOLCALLS: "12" })), "DCP_REMIND_TOOLCALLS has no effect");
 }
 
 // ---------------------------------------------------------------------------
-// 16. summary schema — fixed slots + one evidence pointer per fact, and the
-//     strict tier for session_start. Every rejection must leave state untouched
-//     (INV-4); the schema runs before any branch scanning.
+// 16. shape parsing is advisory: problems are reported, bullets are still
+//     recovered (the ancestor index and the model's own text depend on it).
 // ---------------------------------------------------------------------------
 {
-  const mk = () => {
-    const st = createSessionState();
-    return { st, tool: createCompressTool({ state: st, logger, zod: zodStub, persist: () => {} }) };
-  };
-  const ctx = makeCtx(convo().slice(0, 9));
-  /** Slot text with raw per-slot bodies (default a well-formed bullet). */
-  const raw = (bodies: Partial<Record<string, string>> = {}): string =>
-    SLOTS.map((slot) => `## ${slot}\n${bodies[slot] ?? "- ok 证据: f:1"}`).join("\n");
-  /** Canonical summary with every fact replaced by a vague, unlocatable claim. */
-  const weak = sum("m").replaceAll("证据: smoke-test.ts:1", "证据: 我记得");
-  /** Canonical slots with 已完成 and 未完成 swapped. */
-  const swapped = (() => {
-    const blocks = SLOTS.map((slot) => `## ${slot}\n- ok 证据: f:1`);
-    [blocks[1], blocks[2]] = [blocks[2], blocks[1]];
-    return blocks.join("\n");
-  })();
+  const problemsOf = (text: string): string => parseSummary(text).problems.join(" | ");
 
-  // accepted shapes
-  {
-    const { st, tool } = mk();
-    await tool.execute("t_ok1", { startAnchor: "a1", summary: sum("canonical") }, undefined, undefined, ctx);
-    assert(st.blocks.length === 1, "canonical slot summary accepted");
-  }
-  {
-    const { st, tool } = mk();
-    await tool.execute("t_ok2", { startAnchor: "a1", summary: sum("m", { 约束: "无", 在跑作业与句柄: "无" }) }, undefined, undefined, ctx);
-    assert(st.blocks.length === 1, '"- 无" fills a slot that has nothing to report');
-  }
-  {
-    // vague evidence is only fatal at the strict tier — tier 1 still accepts it,
-    // so small compressions stay cheap
-    const { st, tool } = mk();
-    await tool.execute("t_ok3", { startAnchor: "a1", summary: weak }, undefined, undefined, ctx);
-    assert(st.blocks.length === 1, "tier 1 tolerates a vague evidence pointer");
-  }
+  const canonical = parseSummary(sum("m"));
+  assert(canonical.problems.length === 0, "canonical summary parses with no problems");
+  assert(canonical.bySlot.get("当前任务")?.length === 1, "bullets land in their slot");
 
-  // rejected shapes
-  const cases: [string, string, RegExp][] = [
-    ["missing slot", sum("m").replace("## 未完成\n- m — 未完成 证据: smoke-test.ts:1\n", ""), /缺少槽位：未完成/],
-    ["wrong slot order", swapped, /顺序错误/],
-    ["unknown slot", sum("m").replace("## 约束", "## 备注"), /未知槽位「备注」/],
-    ["bullet without evidence", raw({ 约束: "- 只改了文档" }), /证据: <定位>/],
-    ["non-bullet line", raw({ 约束: "只改了文档 证据: f:1" }), /以「- 」开头/],
-    ["empty 当前任务", raw({ 当前任务: "- 无" }), /必须是实际任务/],
-    ["free-form preamble", `先说一下背景。\n${sum("m")}`, /第一条内容之前/],
-    ["pasted fact", raw({ 约束: `- ${"字".repeat(601)} 证据: f:1` }), /事实过长/],
-    ["evidence placeholder", raw({ 约束: "- 事实 证据: 无" }), /没有意义/],
+  assert(/缺少槽位/.test(problemsOf(sum("m").replace("## 未完成", "## 备注"))), "unknown slot reported (and the slot counted missing)");
+  assert(/不在建议列表/.test(problemsOf(sum("m").replace("## 约束", "## 备注"))), "unknown slot named");
+  assert(/证据/.test(problemsOf("## 当前任务\n- 只改了文档")), "missing evidence pointer reported");
+  assert(/以「- 」开头/.test(problemsOf("## 当前任务\n只改了文档 证据: f:1")), "non-bullet line reported");
+  assert(/没有槽位标题/.test(problemsOf("先说一下背景。\n做完了。")), "free-form summary reported as headerless");
+  assert(!/过长/.test(problemsOf(`## 当前任务\n- ${"字".repeat(2000)} 证据: f:1`)), "a long fact is no longer a problem — length caps are gone");
+
+  // parsing never throws, whatever comes in
+  assert(parseSummary("").bullets.length === 0, "empty summary parses to nothing");
+  assert(parseSummary("## 已完成\n- 无").bySlot.get("已完成")?.length === 1, '"- 无" keeps its slot filled');
+}
+
+// ---------------------------------------------------------------------------
+// 17. chain recall: absorbing a block keeps its text, renders one index line,
+//     and `expand` returns it in full — three levels deep.
+// ---------------------------------------------------------------------------
+{
+  const st = createSessionState();
+  const compress = createCompressTool({ state: st, logger, zod: zodStub, persist: () => {} });
+  const expand = createExpandTool({ state: st, logger, zod: zodStub });
+
+  const L1 = sum("第一段: 摸底 src/a.ts");
+  const L2 = sum("第二段: 实现 x.ts");
+  const L3 = sum("第三段: 发布");
+  const chain: AgentMessage[] = [
+    { role: "user", content: [txt("prompt")] },
+    { role: "assistant", content: [tu("m1", "bash", { command: "ls" })] },
+    tres("m1", "bash", "files"),
+    { role: "assistant", content: [tu("c1", "compress", { startAnchor: "session_start", summary: L1 })] },
+    tres("c1", "compress", "ok"),
+    { role: "assistant", content: [tu("m2", "bash", { command: "build" })] },
+    tres("m2", "bash", "built"),
+    { role: "assistant", content: [tu("c2", "compress", { startAnchor: "session_start", summary: L2 })] },
+    tres("c2", "compress", "ok"),
+    { role: "assistant", content: [tu("m3", "bash", { command: "release" })] },
+    tres("m3", "bash", "released"),
+    { role: "assistant", content: [tu("c3", "compress", { startAnchor: "session_start", summary: L3 })] },
+    tres("c3", "compress", "ok"),
   ];
-  for (const [label, text, pattern] of cases) {
-    const { st, tool } = mk();
-    await assertThrows(
-      () => tool.execute("t_bad", { startAnchor: "a1", summary: text }, undefined, undefined, ctx),
-      pattern,
-      `summary rejected: ${label}`,
-    );
-    assert(st.blocks.length === 0 && st.dirty === false, `INV-4: ${label} leaves state untouched`);
-  }
 
-  // strict tier (session_start + force): real work record + locatable evidence
-  const strict: [string, string, RegExp][] = [
-    ["已完成 empty", sum("m", { 已完成: "无" }), /「已完成」写明实际内容/],
-    ["未完成 empty", sum("m", { 未完成: "无" }), /「未完成」写明实际内容/],
-    ["vague evidence", weak, /不含任何定位/],
-  ];
-  for (const [label, text, pattern] of strict) {
-    const { st, tool } = mk();
-    await assertThrows(
-      () => tool.execute("t_strict", { startAnchor: "session_start", summary: text, force: true }, undefined, undefined, ctx),
-      pattern,
-      `full-session summary rejected: ${label}`,
-    );
-    assert(st.blocks.length === 0, `INV-4: strict ${label} leaves state untouched`);
-  }
+  // compress in order, each span reaching back over the previous one
+  const r1 = await compress.execute("c1", { startAnchor: "session_start", summary: L1 }, undefined, undefined, makeCtx(chain.slice(0, 4)));
+  assert(st.blocks.length === 1 && st.blocks[0].id === 1, "level 1 block recorded");
+  assert(!textOf(r1).includes("Absorbed"), "first compression absorbs nothing");
+  await compress.execute("c2", { startAnchor: "session_start", summary: L2 }, undefined, undefined, makeCtx(chain.slice(0, 8)));
+  const r3 = await compress.execute("c3", { startAnchor: "session_start", summary: L3 }, undefined, undefined, makeCtx(chain.slice(0, 12)));
+
+  assert(st.blocks.length === 3, "absorbed blocks keep their state entry (nothing is deleted)");
+  const b1 = st.blocks.find((b) => b.id === 1)!;
+  const b2 = st.blocks.find((b) => b.id === 2)!;
+  const b3 = st.blocks.find((b) => b.id === 3)!;
+  assert(b1.supersededBy === 2 && b2.supersededBy === 3 && b3.supersededBy === null, "supersede chain links 1 → 2 → 3");
+  assert(b3.parentIds.join(",") === "2" && b2.parentIds.join(",") === "1", "each block names only its direct parent");
+  assert(textOf(r3).includes("块 2") && textOf(r3).includes("块 1"), "compress result lists the absorbed chain with gists");
+  assert(textOf(r3).includes("expand({block: 2})") && textOf(r3).includes("expand({block: 1})"), "compress result tells the model how to expand");
+
+  // rendering: newest summary in full + one index line per ancestor, no full
+  // ancestor text — the chain costs lines, not bytes
+  const out = applyCompressions(st, logger, clone(chain));
+  const injected = firstText(out.find((m) => firstText(m).includes("[Compressed:"))!);
+  assert(injected.includes("第三段"), "newest summary rendered in full");
+  assert(injected.includes("已并入本块的旧压缩块"), "ancestor index rendered");
+  assert(!injected.includes("第一段: 摸底") || injected.split("第一段: 摸底").length === 2, "ancestor text does not leak into the index beyond its gist line");
+  const indexLines = injected.split("\n").filter((l) => l.startsWith("- 块 "));
+  assert(indexLines.length === 2, `one index line per ancestor (got ${indexLines.length})`);
+  assert(indexLines.every((l) => l.length < 200), "index lines stay short");
+
+  // expand returns the full ancestor text, and its own index for deeper recall
+  const ex2 = await expand.execute("e1", { block: 2 }, undefined, undefined, makeCtx(chain));
+  assert(textOf(ex2).includes("第二段: 实现 x.ts"), "expand returns the block's whole summary");
+  assert(textOf(ex2).includes("expand({block: 1})"), "expand points one level further back");
+  const ex1 = await expand.execute("e2", { block: 1 }, undefined, undefined, makeCtx(chain));
+  assert(textOf(ex1).includes("第一段: 摸底 src/a.ts"), "expand reaches the oldest block");
+  await assertThrows(() => expand.execute("e3", { block: 42 }, undefined, undefined, makeCtx(chain)), /unknown compression block 42/, "unknown block id throws with the known ids");
+  await assertThrows(() => expand.execute("e4", { block: "x" as unknown as number }, undefined, undefined, makeCtx(chain)), /numeric/, "non-numeric block id throws");
+
+  // a live block that reaches back over an earlier one absorbs it, so the
+  // chain always has exactly one live tip per span
+  assert(renderBlock(st.blocks, b3).ancestors.length === 2, "renderBlock exposes both ancestors for the live tip");
 }
 
 // ---------------------------------------------------------------------------
-// 17. baseline inheritance — a compress that absorbs a prior block must carry
-//     that block's locatable facts, or say they are superseded. This is the
-//     failure that made session 01a18dc1 re-propose already-committed work.
+// 18. no call-count trigger: the policy carries only the token threshold, and
+//     the stale-usage guard still keeps the first post-compress request quiet.
 // ---------------------------------------------------------------------------
 {
-  const slotSummary = (bodies: Record<string, string>): string =>
-    SLOTS.map((slot) => `## ${slot}\n- ${bodies[slot] ?? "无"}`).join("\n");
+  const policyShape = parseRemindPolicy({});
+  assert(Object.keys(policyShape).join(",") === "tokenThreshold", "remind policy is token-threshold only");
+  assert(DEFAULT_TOKEN_THRESHOLD === 0.4, "default token threshold is 0.4");
+  assert(parseRemindPolicy({ DCP_REMIND_THRESHOLD: "0.7" }).tokenThreshold === 0.7, "env overrides the token threshold");
+  assert(parseRemindPolicy({ DCP_REMIND_THRESHOLD: "abc" }).tokenThreshold === DEFAULT_TOKEN_THRESHOLD, "garbage env falls back to the default");
 
-  const OLD = slotSummary({
-    当前任务: "旧工作单元 证据: src/legacy.ts:1",
-    已完成: "新增 src/legacy.ts 导出 证据: src/legacy.ts:12",
-    约束: "不得改动 `INV-4` 语义 证据: docs/design.md:64",
-  });
-
-  /** Prior block (a1 → tu_c1) is fully contained in the new span (tu_c2). */
-  const harness = (oldSummary = OLD) => {
-    const st = createSessionState();
-    st.blocks.push({
-      id: 2,
-      startName: "a1",
-      startToolCallId: "tu_a1",
-      summary: oldSummary,
-      compressCallId: "tu_c1",
-      createdAt: 1,
-    });
-    st.nextBlockId = 3;
-    const tool = createCompressTool({ state: st, logger, zod: zodStub, persist: () => {} });
-    const msgs: AgentMessage[] = [
-      { role: "user", content: [txt("p")] },
-      { role: "assistant", content: [anchorCall("tu_a1", "a1")] },
-      tres("tu_a1", "add_anchor", "1"),
-      { role: "assistant", content: [txt("work"), tu("tu_m1", "bash", { command: "ls" })] },
-      tres("tu_m1", "bash", "files"),
-      { role: "assistant", content: [tu("tu_c1", "compress", { startAnchor: "a1", summary: oldSummary })] },
-      tres("tu_c1", "compress", "ok"),
-      { role: "assistant", content: [txt("more")] },
-      { role: "assistant", content: [tu("tu_c2", "compress", { startAnchor: "session_start", summary: "new" })] },
-      tres("tu_c2", "compress", "ok"),
-    ];
-    return { st, tool, ctx: makeCtx(msgs) };
-  };
-
-  /** Strict-tier summary that carries every locator of OLD unless overridden. */
-  const carried = (overrides: Record<string, string> = {}): string =>
-    slotSummary({
-      当前任务: "接着旧工作单元 证据: src/legacy.ts:1",
-      已完成: "旧导出保留 证据: src/legacy.ts:12",
-      未完成: "跑测试 证据: smoke-test.ts:1",
-      约束: "不得改动 `INV-4` 语义 证据: docs/design.md:64",
-      ...overrides,
-    });
-
-  // inheritance satisfied → absorbed
-  {
-    const { st, tool, ctx } = harness();
-    const next = carried();
-    const res = await tool.execute("tu_c2", { startAnchor: "session_start", summary: next, force: true }, undefined, undefined, ctx);
-    assert(st.blocks.length === 1 && st.blocks[0].summary === next, "absorbing summary that carries the old locators is accepted");
-    assert(textOf(res).includes("Absorbed 1 prior compression"), "absorption of an inherited block is reported");
-  }
-
-  // a dropped constraint key is refused, and nothing mutates
-  {
-    const { st, tool, ctx } = harness();
-    await assertThrows(
-      () => tool.execute("tu_c2", { startAnchor: "session_start", summary: carried({ 约束: "无" }), force: true }, undefined, undefined, ctx),
-      /基线继承[\s\S]*inv-4/,
-      "absorbing summary that drops a constraint locator is refused",
-    );
-    assert(st.blocks.length === 1 && st.blocks[0].summary === OLD && st.nextBlockId === 3, "INV-4: inheritance rejection leaves state untouched");
-  }
-
-  // a dropped completed-work locator is refused even when the rest is detailed
-  {
-    const { st, tool, ctx } = harness();
-    await assertThrows(
-      () =>
-        tool.execute(
-          "tu_c2",
-          {
-            startAnchor: "session_start",
-            summary: carried({ 当前任务: "继续 证据: smoke-test.ts:1", 已完成: "全部测试通过 证据: smoke-test.ts:9" }),
-            force: true,
-          },
-          undefined,
-          undefined,
-          ctx,
-        ),
-      /src\/legacy\.ts/,
-      "absorbing summary that drops a completed-work locator is refused",
-    );
-    assert(st.blocks.length === 1 && st.blocks[0].summary === OLD, "refused absorption records no new block");
-  }
-
-  // explicit supersede keeps the locator and passes
-  {
-    const { st, tool, ctx } = harness();
-    const next = slotSummary({
-      当前任务: "改用新模块 证据: src/legacy.ts:1",
-      已完成: "旧导出已废弃：改由 src/new.ts 提供 证据: src/legacy.ts:12",
-      未完成: "补测试 证据: smoke-test.ts:1",
-      约束: "不得改动 `INV-4` 语义 证据: docs/design.md:64",
-    });
-    await tool.execute("tu_c2", { startAnchor: "session_start", summary: next, force: true }, undefined, undefined, ctx);
-    assert(st.blocks.length === 1 && st.blocks[0].summary === next, "explicitly superseded fact (with its locator) is accepted");
-  }
-
-  // locator matching ignores slot moves, case and separators
-  {
-    const { st, tool, ctx } = harness(slotSummary({ 当前任务: "旧 证据: a.ts:1", 已完成: "改 src\\legacy.ts 的导出 证据: a.ts:2" }));
-    const next = carried({ 约束: "无", 已完成: "见 SRC/Legacy.ts 证据: smoke-test.ts:1" });
-    await tool.execute("tu_c2", { startAnchor: "session_start", summary: next, force: true }, undefined, undefined, ctx);
-    assert(st.blocks.length === 1 && st.blocks[0].summary === next, "locator survives slot move, case change and separator change");
-  }
-
-  // facts without a locator are not checked, and pre-schema blocks never block
-  {
-    const plain = slotSummary({ 当前任务: "旧 证据: a.ts:1", 已完成: "修好了渲染 证据: a.ts:2" });
-    const { st, tool, ctx } = harness(plain);
-    await tool.execute("tu_c2", { startAnchor: "session_start", summary: carried({ 约束: "无" }), force: true }, undefined, undefined, ctx);
-    assert(st.blocks.length === 1 && st.blocks[0].summary !== plain, "fact without a locator is not required to survive");
-  }
-  {
-    const freeForm = "历史自由文本：改过 src/legacy.ts，细节见旧日志";
-    const { st, tool, ctx } = harness(freeForm);
-    await tool.execute("tu_c2", { startAnchor: "session_start", summary: carried({ 约束: "无" }), force: true }, undefined, undefined, ctx);
-    assert(st.blocks.length === 1 && st.blocks[0].summary !== freeForm, "pre-schema block is skipped instead of blocking the compress");
-  }
-}
-
-// ---------------------------------------------------------------------------
-// 18. budget cost resets from the durable watermark, including a compress that
-//     leaves no compress call in the message stream (eval kernel:
-//     await tool.write({path:"xd://compress"})). Live session 01a18dc1 claimed
-//     "60 tool calls since the last compress" right after a successful one.
-// ---------------------------------------------------------------------------
-{
   const st = createSessionState();
   const tool = createCompressTool({ state: st, logger, zod: zodStub, persist: () => {} });
   // usage 900 describes the pre-compression context — exactly the report that
   // must stop anchoring the estimate afterwards
   const turn: AgentMessage = { role: "assistant", content: [txt("turn done")], usage: { input: 900, output: 0, totalTokens: 900 } };
-  const msgs = [...convo().slice(0, 9), turn]; // no compress call anywhere in the stream
+  const msgs = [...convo().slice(0, 9), turn];
   await tool.execute("tu_wm", { startAnchor: "a1", summary: sum("watermark") }, undefined, undefined, makeCtx(msgs));
-  assert(st.toolCallMark === countToolCalls(msgs), "compress records the watermark from the live tool-call count");
   assert(st.usageMark === 900, "compress records the pre-compression usage report as stale");
   assert(estimateContextTokens(msgs, 900) < 900, "stale usage falls back to the character estimate");
-  const win = { ...makeCtx(msgs), model: { id: "m", contextWindow: 1000 } };
-  assert(maybeAppendReminder(msgs, win, tok(0.8), 0, 900) === msgs, "no token reminder from a stale usage report");
-  assert(maybeAppendReminder(msgs, win, tok(0.8), 0, 0).length === msgs.length + 1, "control: without the mark the same usage still fires");
-
-  const policy = { tokenThreshold: 0, toolCallBudget: 40 };
-  assert(maybeAppendReminder(msgs, makeCtx(msgs), policy, st.toolCallMark) === msgs, "no budget reminder right after a compression");
-
-  const many = [...msgs, { role: "assistant", content: Array.from({ length: 40 }, (_, i) => tu(`wm${i}`, "bash", { command: "x" })) }];
-  const fired = maybeAppendReminder(many, makeCtx(many), policy, st.toolCallMark);
-  const firedText = firstText(fired[fired.length - 1]);
-  assert(fired.length === many.length + 1 && firedText.includes(BUDGET_MARKER), "budget fires only after 40 calls past the watermark");
-  assert(firedText.includes("force=true"), "a full-session wipe is called out instead of offered as a peer anchor");
+  const win: ExtensionContext = { ...makeCtx(msgs), model: { id: "m", contextWindow: 1000 } };
+  assert(maybeAppendReminder(msgs, win, tok(0.8), 900) === msgs, "no token reminder from a stale usage report");
+  assert(maybeAppendReminder(msgs, win, tok(0.8), 0).length === msgs.length + 1, "control: without the mark the same usage still fires");
 }
 
 // ---------------------------------------------------------------------------
@@ -1089,11 +975,11 @@ const compressTool = createCompressTool({
     { role: "assistant", content: [txt("turn")], usage: { input: tokens, output: 0, totalTokens: tokens } },
   ];
   const ctxAt = (tokens: number): ExtensionContext => ({ ...makeCtx(at(tokens)), model: { id: "m", contextWindow: 1000 } });
-  const policy = { tokenThreshold: 0.4, toolCallBudget: 0 };
-  const cursor = { remindLevel: 0 };
+  const policy = tok(0.4);
+  const cursor: RemindCursor = { remindLevel: 0, unitRemindId: null };
   const fire = (tokens: number): boolean => {
     const m = at(tokens);
-    return maybeAppendReminder(m, ctxAt(tokens), policy, 0, 0, cursor).length === m.length + 1;
+    return maybeAppendReminder(m, ctxAt(tokens), policy, 0, cursor).length === m.length + 1;
   };
 
   assert(fire(410), "first crossing of the threshold reports");
@@ -1114,8 +1000,10 @@ const compressTool = createCompressTool({
 // ---------------------------------------------------------------------------
 // 20. the evidence terminator: `证据:` may directly follow the fact text (a
 //     Chinese sentence ends with 。) and anything after the locator is part of
-//     the evidence. Requiring whitespace rejected well-formed bullets and only
-//     taught the model to rewrite locators (feedback fb_mvx4d0fn9o6n).
+//     the evidence. Locators themselves are never whitelisted — a commit hash,
+//     a root-level filename or a bare command are all fine (session 01a19fdd
+//     lost 9 of 20 compressions to a punctuation whitelist that rejected
+//     `7756e8c`, `stonecutter.properties.toml` and `git log --oneline -3`).
 // ---------------------------------------------------------------------------
 {
   const withEvidence = (bullet: string): string =>
@@ -1129,7 +1017,7 @@ const compressTool = createCompressTool({
     ].join("\n");
 
   const tight = parseSummary(withEvidence("。证据: src/summary.ts:60"));
-  assert(tight.bullets[0].fact === "做事。", "「。」后直接写「证据:」仍然合规（不需要前置空格）");
+  assert(tight.bullets[0].fact === "做事。", "「。」后直接写「证据:」仍然拆得开（不需要前置空格）");
   assert(tight.bullets[0].evidence === "src/summary.ts:60", "定位原样取出");
 
   const annotated = parseSummary(withEvidence("证据: src/summary.ts:60（含中文说明）"));
@@ -1138,12 +1026,11 @@ const compressTool = createCompressTool({
   const repeated = parseSummary(withEvidence("要求行内出现 证据: 即可，真正的定位 证据: src/summary.ts:68"));
   assert(repeated.bullets[0].evidence === "src/summary.ts:68", "事实里重复出现「证据」时按最后一处切分");
 
-  try {
-    parseSummary(withEvidence("这条没有任何定位"));
-    assert(false, "没有「证据:」的条目应当被拒绝");
-  } catch (e) {
-    const text = e instanceof Error ? e.message : String(e);
-    assert(/证据/.test(text) && text.includes("空格可省"), "缺证据的报错说明可接受的形式");
+  // every locator shape the old whitelist refused is accepted as-is
+  for (const locator of ["7756e8c", "stonecutter.properties.toml", ".mcmcp", "git log --oneline -3", "用户原始需求", "unzip -l universal.jar"]) {
+    const parsed = parseSummary(withEvidence(`证据: ${locator}`));
+    assert(parsed.bullets[0].evidence === locator, `定位不设白名单：${locator}`);
+    assert(parsed.problems.length === 0, `定位不设白名单且不产生提示：${locator}`);
   }
 }
 
