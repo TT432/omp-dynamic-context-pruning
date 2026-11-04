@@ -20,9 +20,11 @@
 import type { CustomEntry, ExtensionAPI, SessionEntry } from "./omp";
 
 export const PERSIST_TYPE = "dcp-state";
-const PERSIST_VERSION = 5;
+const PERSIST_VERSION = 6;
 /** Oldest version whose block list can be migrated (chain-less but intact). */
 const MIGRATABLE_VERSION = 4;
+/** First version whose blocks carry chain fields (`parentIds` / `supersededBy`). */
+const CHAIN_VERSION = 5;
 
 export interface CompressionBlock {
   id: number;
@@ -65,13 +67,6 @@ export interface SessionState {
    * spam. Reset to 0 once the estimate drops back under the threshold.
    */
   remindLevel: number;
-  /**
-   * toolCallId of the `todo` result whose work-unit boundary was already
-   * reported. Without it `[dcp:unit]` repeats on every request until the model
-   * happens to call `todo` again — the newest completed todo result stays
-   * "completed" forever.
-   */
-  unitRemindId: string | null;
   /** Durable divergence from the last persisted dcp-state entry. */
   dirty: boolean;
 }
@@ -84,7 +79,6 @@ export function createSessionState(): SessionState {
     lastCompaction: 0,
     usageMark: 0,
     remindLevel: 0,
-    unitRemindId: null,
     dirty: false,
   };
 }
@@ -97,7 +91,6 @@ export function resetForSession(state: SessionState, sessionId: string): void {
   state.lastCompaction = 0;
   state.usageMark = 0;
   state.remindLevel = 0;
-  state.unitRemindId = null;
   state.dirty = false;
 }
 
@@ -108,7 +101,6 @@ interface SerializedState {
   blocks: CompressionBlock[];
   usageMark: number;
   remindLevel: number;
-  unitRemindId: string | null;
 }
 
 export function saveSessionState(pi: ExtensionAPI, state: SessionState): void {
@@ -120,7 +112,6 @@ export function saveSessionState(pi: ExtensionAPI, state: SessionState): void {
       blocks: state.blocks,
       usageMark: state.usageMark,
       remindLevel: state.remindLevel,
-      unitRemindId: state.unitRemindId,
     };
     const result = pi.appendEntry(PERSIST_TYPE, data);
     state.dirty = false;
@@ -160,8 +151,8 @@ function migrateBlock(value: CompressionBlock, version: number): CompressionBloc
     startToolCallId: value.startToolCallId,
     summary: value.summary,
     compressCallId: value.compressCallId,
-    parentIds: version >= PERSIST_VERSION ? parents : [],
-    supersededBy: version >= PERSIST_VERSION ? superseded : null,
+    parentIds: version >= CHAIN_VERSION ? parents : [],
+    supersededBy: version >= CHAIN_VERSION ? superseded : null,
     createdAt: typeof value.createdAt === "number" ? value.createdAt : 0,
   };
 }
@@ -180,7 +171,7 @@ export function loadSessionState(entries: SessionEntry[], state: SessionState): 
   const data: unknown = latest.data;
   if (typeof data !== "object" || data === null) return false;
   if (!("v" in data) || typeof data.v !== "number") return false;
-  if (data.v !== PERSIST_VERSION && data.v !== MIGRATABLE_VERSION) return false;
+  if (!(data.v >= MIGRATABLE_VERSION && data.v <= PERSIST_VERSION)) return false;
   if (!("blocks" in data) || !Array.isArray(data.blocks)) return false;
 
   const version = data.v;
@@ -194,10 +185,6 @@ export function loadSessionState(entries: SessionEntry[], state: SessionState): 
   state.usageMark = "usageMark" in data && typeof data.usageMark === "number" && data.usageMark >= 0 ? data.usageMark : 0;
   state.remindLevel =
     "remindLevel" in data && typeof data.remindLevel === "number" && data.remindLevel >= 0 ? data.remindLevel : 0;
-  state.unitRemindId =
-    "unitRemindId" in data && typeof data.unitRemindId === "string" && data.unitRemindId.length > 0
-      ? data.unitRemindId
-      : null;
   state.dirty = false;
   return true;
 }

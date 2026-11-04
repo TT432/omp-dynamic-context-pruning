@@ -37,7 +37,6 @@ import type { CompressionBlock, SessionState } from "./state";
 import { ancestorsOf } from "./state";
 import { findToolCallIndex, firstUserMessageIndex, isToolCallBlock } from "./anchors";
 import { SESSION_START_MARKER, formatCompressedSummary, type RenderedBlock } from "./prompts";
-import { gistOf } from "./summary";
 
 interface ResolvedBlock {
   block: CompressionBlock;
@@ -45,6 +44,32 @@ interface ResolvedBlock {
   lo: number;
   /** Compress call message index (exclusive elision bound; summary goes before it). */
   hi: number;
+}
+
+/**
+ * One-line gist for an ancestor index line: the first content line of the
+ * summary (a heading alone says nothing), trimmed. Rendering only — summary
+ * shape is the model's business and is never parsed for validity.
+ */
+export function gistOf(summary: string, max = 160): string {
+  const lines = summary
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0);
+  const body = lines.find((line) => !line.startsWith("#")) ?? lines[0] ?? "";
+  const flat = body
+    .replace(/^[-*]\s+/, "")
+    .replace(/^#+\s*/, "")
+    .replace(/\s+/g, " ")
+    .trim();
+  return flat.length <= max ? flat : `${flat.slice(0, max)}…`;
+}
+
+/** First message index a block's span covers, or -1 when its anchor is gone. */
+function spanStartOf(messages: AgentMessage[], block: CompressionBlock, firstUser: number): number {
+  if (block.startToolCallId === null) return firstUser >= 0 ? firstUser + 1 : -1;
+  const startIdx = findToolCallIndex(messages, block.startToolCallId);
+  return startIdx >= 0 ? startIdx + 1 : -1;
 }
 
 function resolveBlocks(state: SessionState, logger: Logger, messages: AgentMessage[]): ResolvedBlock[] {
@@ -61,12 +86,17 @@ function resolveBlocks(state: SessionState, logger: Logger, messages: AgentMessa
       continue;
     }
     const hi = findToolCallIndex(messages, block.compressCallId);
-    let lo = -1;
-    if (block.startToolCallId === null) {
-      if (firstUser >= 0) lo = firstUser + 1;
-    } else {
-      const startIdx = findToolCallIndex(messages, block.startToolCallId);
-      if (startIdx >= 0) lo = startIdx + 1;
+    let lo = spanStartOf(messages, block, firstUser);
+    // Absorption must widen the surviving span, never narrow it: the absorbed
+    // blocks stop eliding, so whatever they covered from an earlier start has to
+    // be covered here too. Without this, re-compressing from an anchor that sits
+    // inside an older span resurrects that older span's messages (measured:
+    // 29 sessions, 69,699 messages back in context).
+    if (lo >= 0) {
+      for (const ancestor of ancestorsOf(state.blocks, block)) {
+        const ancestorLo = spanStartOf(messages, ancestor, firstUser);
+        if (ancestorLo >= 0 && ancestorLo < lo) lo = ancestorLo;
+      }
     }
     if (hi < 0 || lo < 0 || lo >= hi) {
       logger.warn("Dropping unresolvable compression block", { blockId: block.id, from: block.startName, hi, lo });

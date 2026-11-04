@@ -2,10 +2,9 @@
  * The three DCP tools: add_anchor, compress, expand.
  *
  * Errors are reserved for calls that cannot mean anything — an unknown anchor,
- * a span with nothing in it, an unknown block id. Everything else (summary
- * shape, missing evidence pointers, a long line) comes back as an advisory in
- * the result: a rejection costs a turn and the model reads the same text
- * either way.
+ * a span with nothing in it, an unknown block id. Summary content is never
+ * judged: the shape contract lives in the tool description and dcp has no
+ * opinion on what the model decided to keep.
  */
 
 import type { AgentMessage, ExtensionAPI, ExtensionContext, SessionEntry, ToolDefinition, ToolResult } from "./omp";
@@ -21,7 +20,7 @@ import {
   type AnchorRef,
 } from "./anchors";
 import { ADD_ANCHOR_PROMPT, COMPRESS_PROMPT, EXPAND_PROMPT } from "./prompts";
-import { formatProblems, gistOf, parseSummary } from "./summary";
+import { gistOf } from "./transform";
 import { latestUsageTokens } from "./remind";
 
 // ---------------------------------------------------------------------------
@@ -126,7 +125,7 @@ export function createCompressTool(deps: CompressToolDeps): ToolDefinition {
     }),
     summary: zod.string({
       description:
-        "Plain Markdown string (never a JSON object or key-value map) — the only record of the span; original messages are not recoverable. Recommended slots, in order: ## 当前任务 / ## 已完成 / ## 未完成 / ## 约束 / ## 文件与命令 / ## 在跑作业与句柄; each fact a `- ` bullet ending in `证据: <定位>`. Shape is advisory: a summary that does not follow it is still applied, and cannot be amended afterwards.",
+        "Plain Markdown string (never a JSON object or key-value map) — the only record of the span; original messages are not recoverable. Recommended slots, in order: ## 当前任务 / ## 已完成 / ## 未完成 / ## 约束 / ## 文件与命令 / ## 在跑作业与句柄; each fact a `- ` bullet ending in `证据: <定位>`. Nothing here is validated — write it for the turn that has to continue the work.",
     }),
   });
 
@@ -145,11 +144,6 @@ export function createCompressTool(deps: CompressToolDeps): ToolDefinition {
       }
       const startName = p.startAnchor.trim();
       const summary = p.summary;
-
-      // Advisory only: shape problems ride the result, they never block the
-      // compression (a rejection costs a turn and the model re-sends the same
-      // draft anyway).
-      const parsed = parseSummary(summary);
 
       const messages = branchMessages(ctx);
       if (messages.length === 0) {
@@ -188,8 +182,8 @@ export function createCompressTool(deps: CompressToolDeps): ToolDefinition {
 
       // Anchors that sit inside the span are elided with it. The model cannot
       // see them afterwards (the reminder scans the transformed copy), so the
-      // result has to say which names vanished — otherwise reusing one of them
-      // later starts a span inside the old block and resurrects elided text.
+      // result names them: a swallowed anchor is not a live start point, and
+      // the model would otherwise plan a compress from a name it cannot reach.
       const swallowed = anchors.filter(
         (a) => a.toolCallId !== null && a.msgIndex >= elideFrom && a.msgIndex < endIdx,
       );
@@ -218,7 +212,6 @@ export function createCompressTool(deps: CompressToolDeps): ToolDefinition {
         from: startName,
         elidedMessages: elided,
         absorbedBlocks: absorbed.map((b) => b.id),
-        problems: parsed.problems.length,
       });
 
       const chain = ancestorsOf(state.blocks, block);
@@ -230,18 +223,17 @@ export function createCompressTool(deps: CompressToolDeps): ToolDefinition {
           : "";
       const swallowedNote =
         swallowed.length > 0
-          ? ` Anchors swallowed by this span (now elided, not reusable): ${swallowed
+          ? ` Anchors swallowed by this span (no longer live start points): ${swallowed
               .map((a) => `"${a.name}"`)
-              .join(", ")}. Do not pass them to compress again — place the next anchor after this call.`
+              .join(", ")}.`
           : "";
       return textResult(
-        `Compressed from "${startName}" to this compress call (${elided} message(s) elided) as block ${block.id}.${absorbedNote}${swallowedNote} The summary now replaces that span in your context, right before this compress call.${formatProblems(parsed.problems)}`,
+        `Compressed from "${startName}" to this compress call (${elided} message(s) elided) as block ${block.id}.${absorbedNote}${swallowedNote} The summary now replaces that span in your context, right before this compress call. Place the next anchor AFTER this call: an anchor added before a compress call is swallowed by its span, while one added now marks the start of the next unit and stays usable.`,
         {
           blockId: block.id,
           elidedMessages: elided,
           absorbedBlockIds: absorbed.map((b) => b.id),
           swallowedAnchors: swallowed.map((a) => a.name),
-          problems: parsed.problems,
         },
       );
     },

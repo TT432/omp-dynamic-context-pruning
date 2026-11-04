@@ -10,9 +10,10 @@
  * span from the anchor up to the compress call itself — the end is implicit,
  * there is no endAnchor. Absorbed blocks form a chain: their text stays in
  * state, renders as an index line, and comes back in full through `expand`.
- * Nothing about a summary is rejected; shape problems ride the result.
+ * Summary content is never checked: no shape parse, no advisory, no rejection.
  *
- * Run: bun smoke-test.ts
+ * Run: bun smoke-test.ts (or node --experimental-strip-types
+ * --experimental-loader ./work/ts-resolve.mjs smoke-test.ts)
  */
 import { scanAnchors, firstUserMessageIndex } from "./src/anchors";
 import { applyCompressions, renderBlock } from "./src/transform";
@@ -34,15 +35,12 @@ import {
   estimateContextTokens,
   maybeAppendReminder,
   REMIND_MARKER,
-  UNIT_MARKER,
   parseRemindPolicy,
   DEFAULT_TOKEN_THRESHOLD,
   tokenBracket,
-  finishedTodoSet,
   type RemindCursor,
 } from "./src/remind";
 import { Logger } from "./src/logger";
-import { parseSummary } from "./src/summary";
 import type { AgentMessage, ExtensionAPI, ExtensionContext, SessionEntry, ToolDefinition, ToolResult } from "./src/omp";
 
 const logger = new Logger(false);
@@ -108,7 +106,7 @@ function firstText(message: AgentMessage): string {
   return typeof block.text === "string" ? block.text : "";
 }
 
-/** Recommended slot order of the summary shape (mirrors src/summary.ts). */
+/** Slot order recommended by the compress tool description (test fixture only). */
 const SLOTS = ["当前任务", "已完成", "未完成", "约束", "文件与命令", "在跑作业与句柄"];
 
 /** A slot-structured summary; `marker` lands in every slot's fact. */
@@ -320,7 +318,8 @@ const compressTool = createCompressTool({
   assert(appended.length === before + 1 && appended[before].customType === PERSIST_TYPE, "compress appended a dcp-state entry");
   assert(textOf(res).includes('Compressed from "a1" to this compress call'), "compress result confirms the range");
   assert(textOf(res).includes("5 message(s) elided"), "elided count spans from after the anchor to the compress call");
-  assert(!textOf(res).includes("摘要形状提示"), "a well-shaped summary produces no advisory");
+  assert(!textOf(res).includes("摘要形状提示"), "no shape advisory exists any more");
+  assert(textOf(res).includes("Place the next anchor AFTER this call"), "result carries the durable next-anchor instruction");
 
   // same result when the in-flight call IS already on the branch
   const s3b = createSessionState();
@@ -421,9 +420,9 @@ const compressTool = createCompressTool({
 }
 
 // ---------------------------------------------------------------------------
-// 6. nothing about a summary is rejected: shape problems are advisory and the
-//    compression still applies. Only meaningless calls throw (unknown anchor,
-//    empty span, empty summary) — each of those leaves state untouched.
+// 6. summary content is never validated: prose and odd headings compress as-is
+//    and the result carries no shape feedback. Only meaningless calls throw
+//    (unknown anchor, empty span, empty summary) — those leave state untouched.
 // ---------------------------------------------------------------------------
 {
   const mk = () => {
@@ -459,8 +458,10 @@ const compressTool = createCompressTool({
     const prose = "先做了摸底，然后改了 x.ts，测试通过，下一步跑 1.20.1。";
     const res = await tool.execute("tu_c1", { startAnchor: "a1", summary: prose }, undefined, undefined, ctx);
     assert(st.blocks.length === 1 && st.blocks[0].summary === prose, "free-form summary is applied, not rejected");
-    assert(textOf(res).includes("摘要形状提示"), "advisory names the shape deviation");
-    assert(textOf(res).includes("当前任务"), "advisory restates the recommended slots");
+    assert(
+      !textOf(res).includes("摘要形状提示") && !textOf(res).includes("不在建议列表"),
+      "free-form summary gets no shape feedback",
+    );
     assert(st.nextBlockId === 2, "block id counter advanced");
   }
 
@@ -475,13 +476,13 @@ const compressTool = createCompressTool({
       ctx,
     );
     assert(st.blocks.length === 1, "unknown slot header does not block the compress");
-    assert(textOf(res).includes("不在建议列表"), "advisory reports the unknown slot");
+    assert(!textOf(res).includes("不在建议列表"), "an unknown slot header gets no feedback either");
     assert(renderBlock(st.blocks, st.blocks[0]).summary.includes("## 任务（本轮）"), "the model's own headers are preserved verbatim");
   }
 }
 
 // ---------------------------------------------------------------------------
-// 7. persistence round trip (v5 chain fields) + v4 migration + older ignored
+// 7. persistence round trip (v6 chain fields) + v5/v4 migration + older ignored
 // ---------------------------------------------------------------------------
 {
   const s5 = createSessionState();
@@ -498,7 +499,6 @@ const compressTool = createCompressTool({
   });
   s5.nextBlockId = 8;
   s5.usageMark = 900;
-  s5.unitRemindId = "tu_todo7";
   s5.dirty = true;
   const app: { customType: string; data: unknown }[] = [];
   saveSessionState(makePi(app), s5);
@@ -512,7 +512,44 @@ const compressTool = createCompressTool({
   assert(loaded && s6.blocks.length === 1 && s6.blocks[0].id === 7 && s6.blocks[0].compressCallId === "tu_c", "round trip restores the block");
   assert(s6.nextBlockId === 8, "nextBlockId restored");
   assert(s6.blocks[0].parentIds.join(",") === "5,4" && s6.blocks[0].supersededBy === 8, "chain fields survive the round trip");
-  assert(s6.usageMark === 900 && s6.unitRemindId === "tu_todo7", "reminder watermarks survive the round trip");
+  assert(s6.usageMark === 900, "usage mark survives the round trip");
+  assert(!("unitRemindId" in (app[0].data as Record<string, unknown>)), "the unit watermark is gone from the persisted shape");
+  assert((app[0].data as Record<string, unknown>).v === 6, "state is written as v6");
+
+  // v5 (chain fields, unit watermark) still loads; the dead field is ignored
+  const v5: SessionEntry[] = [
+    {
+      type: "custom",
+      id: "c5",
+      parentId: null,
+      timestamp: new Date().toISOString(),
+      customType: PERSIST_TYPE,
+      data: {
+        v: 5,
+        sessionId: "sess-v5",
+        nextBlockId: 3,
+        blocks: [
+          {
+            id: 2,
+            startName: "a1",
+            startToolCallId: "tu_a1",
+            summary: "v5 block",
+            compressCallId: "tu_c2",
+            parentIds: [1],
+            supersededBy: null,
+            createdAt: 7,
+          },
+        ],
+        usageMark: 42,
+        remindLevel: 3,
+        unitRemindId: "tu_todo9",
+      },
+    },
+  ];
+  const s5b = createSessionState();
+  assert(loadSessionState(v5, s5b) === true && s5b.blocks.length === 1, "v5 entry loads");
+  assert(s5b.blocks[0].parentIds.join(",") === "1", "v5 chain fields are kept");
+  assert(s5b.usageMark === 42 && s5b.remindLevel === 3, "v5 reminder state loads");
   assert(!("toolCallMark" in (app[0].data as Record<string, unknown>)), "the tool-call counter is gone from the persisted shape");
 
   // v4 (pre-chain) entries migrate: absorbed parents were already deleted, so
@@ -809,10 +846,10 @@ const compressTool = createCompressTool({
 }
 
 // ---------------------------------------------------------------------------
-// 15. work-unit boundary reminder: fires once per finished todo set, on every
-//     host wording, and never twice for the same result. The tool-call budget
-//     is gone — a call count is not a context cost (session 01a19fdd compressed
-//     at 40 calls, three minutes in, and re-read three files right after).
+// 15. no work-unit trigger: a completed todo set is not a boundary and must not
+//     produce anything. The todo list is bookkeeping the model fills in under
+//     harness pressure (13 items marked done in one second, 2026-11-04), not a
+//     semantic event; the reminder was removed with that measurement.
 // ---------------------------------------------------------------------------
 {
   const win = (msgs: AgentMessage[], contextWindow = 100000): ExtensionContext => ({
@@ -824,69 +861,49 @@ const compressTool = createCompressTool({
     { role: "assistant", content: [tu("td", "todo", { op: "done" })] },
     tres("td", "todo", text),
   ];
-  const cursor = (): RemindCursor => ({ remindLevel: 0, unitRemindId: null });
-
-  // every finished-set wording the host has emitted
   for (const wording of ["All items complete", "Remaining items (0)", "Remaining items: none.\nOverall: 4/4 done, 0 open."]) {
     const msgs = withTodo(wording);
-    assert(finishedTodoSet(msgs) !== null, `finished todo set detected: ${wording.slice(0, 24)}`);
-    const out = maybeAppendReminder(msgs, win(msgs), REMIND_OFF, 0, cursor());
-    const text = firstText(out[out.length - 1]);
-    assert(out.length === msgs.length + 1 && text.includes(UNIT_MARKER), `unit reminder appended: ${wording.slice(0, 24)}`);
-    assert(text.includes('"a1"'), "unit reminder lists the available anchors");
-    assert(!/force=true/.test(text), "unit reminder no longer demands force");
     assert(
-      text.indexOf("Compress the finished unit") < text.indexOf("call add_anchor"),
-      "unit reminder compresses the finished unit before placing the next anchor",
+      maybeAppendReminder(msgs, win(msgs), REMIND_OFF, 0, { remindLevel: 0 }) === msgs,
+      `no reminder for a finished todo set: ${wording.slice(0, 24)}`,
     );
   }
 
-  // mid-progress todo sets are not boundaries
-  const wip = withTodo("Remaining items (2):\n- build\n- ship");
-  assert(finishedTodoSet(wip) === null, "mid-progress todo set is not a boundary");
-  assert(maybeAppendReminder(wip, win(wip), REMIND_OFF, 0, cursor()) === wip, "no unit reminder while the todo set is in progress");
-
-  // dedupe: the same finished result never reminds twice
-  const done = withTodo("Remaining items: none.");
-  const c1 = cursor();
-  const first = maybeAppendReminder(done, win(done), REMIND_OFF, 0, c1);
-  assert(first.length === done.length + 1 && c1.unitRemindId === "td", "first sighting reports and records the watermark");
-  assert(maybeAppendReminder(done, win(done), REMIND_OFF, 0, c1) === done, "same finished todo result stays silent");
-  // a new finished result reports again
-  const done2: AgentMessage[] = [...done, { role: "assistant", content: [tu("td2", "todo", { op: "done" })] }, tres("td2", "todo", "All items complete")];
-  assert(maybeAppendReminder(done2, win(done2), REMIND_OFF, 0, c1).length === done2.length + 1, "a new finished result reports again");
-
-  // one reminder per request; token pressure outranks the unit boundary
-  const hotDone = [...done, { role: "assistant", content: [txt("turn")], usage: { input: 900, output: 0, totalTokens: 900 } }];
-  const hotOut = maybeAppendReminder(hotDone, { ...makeCtx(hotDone), model: { id: "m", contextWindow: 1000 } }, tok(0.8), 0, cursor());
-  assert(hotOut.length === hotDone.length + 1, "exactly one reminder per request");
-  assert(firstText(hotOut[hotOut.length - 1]).includes(REMIND_MARKER), "token pressure outranks the unit boundary");
-
-  // the counter's env var is inert now
+  // the counter's env var is inert
   assert(!("toolCallBudget" in parseRemindPolicy({ DCP_REMIND_TOOLCALLS: "12" })), "DCP_REMIND_TOOLCALLS has no effect");
 }
 
 // ---------------------------------------------------------------------------
-// 16. shape parsing is advisory: problems are reported, bullets are still
-//     recovered (the ancestor index and the model's own text depend on it).
+// 16. anchor identity: the name is recovered from every payload shape the model
+//     actually emits — {"anchor"}, {"name"}, {"name","note"}, {"anchorName",…},
+//     a bare token, and JSON that JSON.parse rejects. Measured over 948 live
+//     payloads (2026-11-04): the old "lone string value" rule lost 3.9% of
+//     anchors, and those silently became unusable for compress.
 // ---------------------------------------------------------------------------
 {
-  const problemsOf = (text: string): string => parseSummary(text).problems.join(" | ");
+  const anchorName = (content: string | Record<string, unknown>): string | null => {
+    const msgs: AgentMessage[] = [
+      { role: "user", content: [txt("p")] },
+      { role: "assistant", content: [tu("tu_x", "write", { path: "xd://add_anchor", content })] },
+    ];
+    const found = scanAnchors(msgs).filter((a) => a.name !== "session_start");
+    return found.length === 1 ? found[0].name : null;
+  };
 
-  const canonical = parseSummary(sum("m"));
-  assert(canonical.problems.length === 0, "canonical summary parses with no problems");
-  assert(canonical.bySlot.get("当前任务")?.length === 1, "bullets land in their slot");
+  assert(anchorName({ anchor: "plain" }) === "plain", '{"anchor"} resolves');
+  assert(anchorName({ name: "n1" }) === "n1", '{"name"} resolves');
+  assert(anchorName({ name: "n2", note: "工作单元说明" }) === "n2", '{"name","note"} resolves (old rule returned null)');
+  assert(anchorName({ name: "n3", title: "批次功能" }) === "n3", '{"name","title"} resolves');
+  assert(anchorName({ name: "n4", i: "Anchoring stretch" }) === "n4", '{"name","i"} resolves');
+  assert(anchorName({ anchorName: "n5", description: "说明" }) === "n5", '{"anchorName","description"} resolves');
+  assert(anchorName({ i: "Anchoring", content: "n6" }) === "n6", '{"i","content"} resolves');
+  assert(anchorName("bare_token") === "bare_token", "a bare non-JSON content is the name");
+  assert(anchorName('{"name":"n7","summary":"line1\nline2"}') === "n7", "a payload with a raw newline still yields the name");
 
-  assert(/缺少槽位/.test(problemsOf(sum("m").replace("## 未完成", "## 备注"))), "unknown slot reported (and the slot counted missing)");
-  assert(/不在建议列表/.test(problemsOf(sum("m").replace("## 约束", "## 备注"))), "unknown slot named");
-  assert(/证据/.test(problemsOf("## 当前任务\n- 只改了文档")), "missing evidence pointer reported");
-  assert(/以「- 」开头/.test(problemsOf("## 当前任务\n只改了文档 证据: f:1")), "non-bullet line reported");
-  assert(/没有槽位标题/.test(problemsOf("先说一下背景。\n做完了。")), "free-form summary reported as headerless");
-  assert(!/过长/.test(problemsOf(`## 当前任务\n- ${"字".repeat(2000)} 证据: f:1`)), "a long fact is no longer a problem — length caps are gone");
-
-  // parsing never throws, whatever comes in
-  assert(parseSummary("").bullets.length === 0, "empty summary parses to nothing");
-  assert(parseSummary("## 已完成\n- 无").bySlot.get("已完成")?.length === 1, '"- 无" keeps its slot filled');
+  // wrong-device or empty payloads must not invent an anchor
+  assert(anchorName({ force: true, startAnchor: "session_start", summary: "# x" }) === null, "a compress-shaped payload is not an anchor");
+  assert(anchorName({}) === null, "an empty payload is not an anchor");
+  assert(anchorName("two words here") === null, "a bare content with whitespace is not a name");
 }
 
 // ---------------------------------------------------------------------------
@@ -993,7 +1010,7 @@ const compressTool = createCompressTool({
   ];
   const ctxAt = (tokens: number): ExtensionContext => ({ ...makeCtx(at(tokens)), model: { id: "m", contextWindow: 1000 } });
   const policy = tok(0.4);
-  const cursor: RemindCursor = { remindLevel: 0, unitRemindId: null };
+  const cursor: RemindCursor = { remindLevel: 0 };
   const fire = (tokens: number): boolean => {
     const m = at(tokens);
     return maybeAppendReminder(m, ctxAt(tokens), policy, 0, cursor).length === m.length + 1;
@@ -1015,40 +1032,56 @@ const compressTool = createCompressTool({
 }
 
 // ---------------------------------------------------------------------------
-// 20. the evidence terminator: `证据:` may directly follow the fact text (a
-//     Chinese sentence ends with 。) and anything after the locator is part of
-//     the evidence. Locators themselves are never whitelisted — a commit hash,
-//     a root-level filename or a bare command are all fine (session 01a19fdd
-//     lost 9 of 20 compressions to a punctuation whitelist that rejected
-//     `7756e8c`, `stonecutter.properties.toml` and `git log --oneline -3`).
+// 20. absorption widens the span. Compressing from an anchor that sits inside an
+//     older span absorbs that block, and the surviving block must keep covering
+//     the older block's start — otherwise the absorbed range resurrects. Live
+//     measurement before the fix: 29 of 236 top-level sessions, 69,699 messages
+//     back in context, worst single event 3,051 messages.
 // ---------------------------------------------------------------------------
 {
-  const withEvidence = (bullet: string): string =>
-    [
-      "## 当前任务", `- 做事${bullet}`,
-      "## 已完成", `- 做完${bullet}`,
-      "## 未完成", `- 下一步${bullet}`,
-      "## 约束", `- 约束${bullet}`,
-      "## 文件与命令", `- 路径${bullet}`,
-      "## 在跑作业与句柄", "- 无",
-    ].join("\n");
+  const msgs: AgentMessage[] = [{ role: "user", content: [txt("prompt")] }];
+  for (const w of ["W1", "W2", "W3", "W4"]) msgs.push({ role: "assistant", content: [txt(w)] });
+  msgs.push({ role: "assistant", content: [anchorCall("tu_a2", "a2")] });
+  for (const w of ["W5", "W6", "W7", "W8"]) msgs.push({ role: "assistant", content: [txt(w)] });
+  msgs.push({
+    role: "assistant",
+    content: [tu("tu_c1", "write", { path: "xd://compress", content: { startAnchor: "session_start", summary: "S1" } })],
+  });
+  msgs.push({
+    role: "assistant",
+    content: [tu("tu_c2", "write", { path: "xd://compress", content: { startAnchor: "a2", summary: "S2" } })],
+  });
+  msgs.push({ role: "user", content: [txt("TAIL-KEPT")] });
 
-  const tight = parseSummary(withEvidence("。证据: src/summary.ts:60"));
-  assert(tight.bullets[0].fact === "做事。", "「。」后直接写「证据:」仍然拆得开（不需要前置空格）");
-  assert(tight.bullets[0].evidence === "src/summary.ts:60", "定位原样取出");
+  const st = createSessionState();
+  st.blocks.push({
+    id: 1,
+    startName: "session_start",
+    startToolCallId: null,
+    summary: "S1",
+    compressCallId: "tu_c1",
+    parentIds: [],
+    supersededBy: 2,
+    createdAt: 1,
+  });
+  st.blocks.push({
+    id: 2,
+    startName: "a2",
+    startToolCallId: "tu_a2",
+    summary: "S2",
+    compressCallId: "tu_c2",
+    parentIds: [1],
+    supersededBy: null,
+    createdAt: 2,
+  });
+  st.nextBlockId = 3;
 
-  const annotated = parseSummary(withEvidence("证据: src/summary.ts:60（含中文说明）"));
-  assert(annotated.bullets[0].evidence === "src/summary.ts:60（含中文说明）", "定位后面的中文说明保留在证据里");
-
-  const repeated = parseSummary(withEvidence("要求行内出现 证据: 即可，真正的定位 证据: src/summary.ts:68"));
-  assert(repeated.bullets[0].evidence === "src/summary.ts:68", "事实里重复出现「证据」时按最后一处切分");
-
-  // every locator shape the old whitelist refused is accepted as-is
-  for (const locator of ["7756e8c", "stonecutter.properties.toml", ".mcmcp", "git log --oneline -3", "用户原始需求", "unzip -l universal.jar"]) {
-    const parsed = parseSummary(withEvidence(`证据: ${locator}`));
-    assert(parsed.bullets[0].evidence === locator, `定位不设白名单：${locator}`);
-    assert(parsed.problems.length === 0, `定位不设白名单且不产生提示：${locator}`);
-  }
+  const render = JSON.stringify(applyCompressions(st, logger, structuredClone(msgs)));
+  assert(!render.includes("W1") && !render.includes("W4"), "the absorbed block's earlier start stays elided (no resurrection)");
+  assert(!render.includes("W5"), "the surviving block's own span is elided");
+  assert(render.includes("TAIL-KEPT"), "the live tail after the compress call is kept");
+  assert(render.includes("块 1"), "the absorbed block still renders as an index line");
+  assert(render.includes("S2"), "the surviving summary carries the span");
 }
 
 console.log(failures === 0 ? "\nALL OK" : `\n${failures} FAILURE(S)`);

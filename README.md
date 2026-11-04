@@ -63,9 +63,10 @@ prompt · [anchor: session_start] · work1 · [Compressed: a1 → here] (block 1
   the model. Blocks persist across session resume (omp custom entries) and are
   dropped automatically if omp compacts the session.
 
-### Summary shape — a request, not a gate
+### Summary shape — prompt only, never checked
 
-A summary is the only record of the span, so the tools ask for a structure:
+A summary is the only record of the span, so the tool description asks for a
+structure:
 
 ```
 ## 当前任务        - 正在做的事 证据: <定位>
@@ -81,14 +82,15 @@ A summary is the only record of the span, so the tools ask for a structure:
 - Every fact is a `- ` bullet ending in `证据: <定位>` — an externalized pointer
   (path, `file:line`, session id, commit, URI, command), **not** pasted content.
   Any locator shape is accepted; there is no whitelist.
-- Deviations come back in the compress result as
-  `摘要形状提示（已压缩，未拒绝）` — the compression always applies, and the
-  summary cannot be amended afterwards. A rejection costs a turn and the model
-  re-sends the same draft anyway; only the absorbed blocks' summaries stay
-  reachable, so a thin first summary is not recoverable.
+- Nothing is checked. There is no shape parser, no advisory in the result and no
+  rejection: whatever the model writes is applied verbatim and cannot be amended
+  afterwards. The contract lives in the tool description, where the model reads
+  it before every call; a second copy in the result only taught the model the
+  validator. (Removed 2026-11-04 — a session with 26+20 advisory lines acted on
+  none of them.)
 - `summary` is a plain Markdown string. The host silently stringifies an
-  object-valued summary, so a JSON or key-value draft passes validation but
-  loses the slot structure (and every `证据:` pointer).
+  object-valued summary, so a JSON or key-value draft passes and loses the slot
+  structure (and every `证据:` pointer).
 
 ## How it works
 
@@ -99,13 +101,19 @@ the messages, DCP:
 
 1. injects the `[anchor: session_start]` marker after the first user message,
 2. elides the span from each live block's start anchor up to its compress call
-   and strips the consumed-anchor blocks,
+   and strips the consumed-anchor blocks. An absorbed block's span is folded
+   into the surviving one — the start is the earliest of the block's own anchor
+   and every ancestor's — so absorbing can only widen the elided range, never
+   narrow it (narrowing resurrects messages that were already gone),
 3. injects each block's summary right before its compress call, followed by one
    index line per absorbed ancestor.
 
 `compress` resolves the anchor name on the persisted branch (positions are
 stable; even consumed anchors remain findable there), validates the span,
-absorbs the blocks it reaches back over, and records the block.
+absorbs the blocks it reaches back over, and records the block. Anchor names are
+read from the call payload in the shapes models actually emit: `anchor`, `name`,
+`anchorName`, `content`, a bare token, or a payload that `JSON.parse` rejects
+(raw newlines) — a name dcp cannot read is an anchor the model cannot use.
 
 ## Installation
 
@@ -125,41 +133,41 @@ Restart omp. The model gets the `add_anchor`, `compress` and `expand` tools.
 Set `DCP_DEBUG=1` in the environment to write per-pass context snapshots
 and structured logs under `~/.omp/agent/logs/dcp/`.
 
-`DCP_REMIND_THRESHOLD` controls the token-pressure reminder: when the estimated
-(post-compression) context crosses the threshold, a `[dcp:context]` reminder
-naming the live anchors is appended to the LLM-facing context urging an
-immediate `compress` — dcp is model-driven, and with omp auto-compaction
-disabled a forgotten compress otherwise walks the context past the window and
-stalls the session. Values: `(0,1)` = fraction of the model's context window
-(default `0.4`), `>=1` = absolute tokens, `0` = disabled.
+`DCP_REMIND_THRESHOLD` controls the token-pressure reminder — the only thing
+dcp pushes into the conversation. When the estimated (post-compression) context
+crosses the threshold, a `[dcp:context]` message reports the estimate, the fill
+percentage and the live anchor names, and says nothing about what to do: when
+and how to compress is the model's call, and that rule lives in the `compress`
+tool description. dcp is model-driven, and with omp auto-compaction disabled a
+forgotten compress otherwise walks the context past the window and stalls the
+session. Values: `(0,1)` = fraction of the model's context window (default
+`0.4`), `>=1` = absolute tokens, `0` = disabled.
 
-A second trigger fires without any token pressure:
+There is no work-unit trigger. The previous `[dcp:unit]` fired whenever the
+newest `todo` result reported a finished item set, but the todo list is
+bookkeeping the model fills in under pressure from the host's stop-reminder, not
+a semantic event: measured 2026-11-04, 13 items were marked done in one second,
+the reminder fired 20 s later, a 1494-message span was compressed, and the
+user's next instruction arrived 16 s after that into a context that no longer
+held the work it referred to.
 
-- `[dcp:unit]` — the newest `todo` result reports a finished item set
-  (`All items complete`, `Remaining items (0)`, `Remaining items: none.`). The
-  work-unit boundary is observable rather than judged, so the reminder demands
-  a compress of the finished unit **first**, then an anchor for the next one.
-  Reversing the order puts the anchor inside the compress span, where it is
-  elided and cannot be reused as a later start point. It fires once per
-  finished result (deduped on the result's tool-call id).
-
-There is no tool-call counter: a call count is not a context cost, and the
+There is no tool-call counter either: a call count is not a context cost, and the
 removed `[dcp:budget]` trigger fired three minutes into a session that then had
 to re-read the files it had just explored.
 
-One reminder at most is appended per request, with token pressure winning. The
-token trigger recomputes on the transformed copy, so a compression silences it.
-The reminder only ever touches the outgoing message copy; session history is
-never modified.
+At most one reminder is appended per request, and it recomputes on the
+transformed copy, so a compression silences it. The reminder only ever touches
+the outgoing message copy; session history is never modified.
 
 ## Verification
 
 - `bunx tsc --noEmit` — type-checks clean. Without bun, `node node_modules/typescript/bin/tsc --noEmit`
   also works (Node 24 is enough).
-- `bun smoke-test.ts` — exercises the full pipeline (anchor scanning, all three
-  tools, transform, accumulation, chain recall/expand, session_start, advisory
-  summaries, persistence round trip + v4 migration, session lifecycle, orphan
-  cleanup) against synthetic omp messages, plus the reminder triggers.
+- `bun smoke-test.ts` — exercises the full pipeline (anchor scanning including
+  the payload shapes that broke it, all three tools, transform, accumulation,
+  span widening on absorption, chain recall/expand, session_start, anchor-name
+  resolution, persistence round trip + v5/v4 migration, session lifecycle,
+  orphan cleanup) against synthetic omp messages, plus the token reminder.
   On a bun-less Windows host, with the resolver hook in `work/`:
   `node --experimental-strip-types --experimental-loader ./work/ts-resolve.mjs smoke-test.ts`.
 

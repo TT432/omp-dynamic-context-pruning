@@ -53,12 +53,42 @@ export function isThinkingBlock(block: ContentBlock): boolean {
   return block.type === "thinking" || block.type === "redacted_thinking";
 }
 
-/** Anchor name from a parsed args object: `anchor` key, or a lone string value (models sometimes guess "name"). */
+/**
+ * Keys that carry a tool's bookkeeping rather than its anchor name. A payload
+ * that mixes `name` with `note`/`title`/`i` must still resolve — the model adds
+ * a note often enough that the old "lone string value" fallback silently lost
+ * 3.9% of all anchors (measured over 948 persisted payloads).
+ */
+const META_KEYS: Record<string, true> = {
+  i: true,
+  intent: true,
+  title: true,
+  note: true,
+  summary: true,
+  description: true,
+  reason: true,
+  path: true,
+  force: true,
+  tool: true,
+  args: true,
+  startAnchor: true,
+  endAnchor: true,
+};
+
+/** Keys holding the anchor name, in priority order. */
+const NAME_KEYS = ["anchor", "name", "anchorName", "content"] as const;
+
+/** Anchor name from a parsed args object (direct call or xd-envelope payload). */
 function readAnchorArg(args: Record<string, unknown>): string | null {
-  const direct = args.anchor;
-  if (typeof direct === "string" && direct.trim().length > 0) return direct.trim();
-  const strings = Object.values(args).filter((v): v is string => typeof v === "string" && v.trim().length > 0);
-  return strings.length === 1 ? strings[0].trim() : null;
+  for (const key of NAME_KEYS) {
+    const value = args[key];
+    if (typeof value === "string" && value.trim().length > 0) return value.trim();
+  }
+  // Last resort: exactly one non-metadata string value.
+  const strings = Object.entries(args).filter(
+    ([key, value]) => META_KEYS[key] === undefined && typeof value === "string" && value.trim().length > 0,
+  );
+  return strings.length === 1 ? (strings[0][1] as string).trim() : null;
 }
 
 /** Parse the xd envelope's `content` payload (a JSON string, or already an object). */
@@ -74,9 +104,30 @@ function parseContentJson(content: unknown): Record<string, unknown> | null {
       return parsed as Record<string, unknown>;
     }
   } catch {
-    /* malformed content is not an anchor */
+    /* malformed content is not an anchor payload — the tolerant path below retries */
   }
   return null;
+}
+
+/**
+ * Payloads that are *almost* JSON (raw newlines inside a summary, an unescaped
+ * quote) make JSON.parse throw. The name is still readable by pattern, and an
+ * anchor the model thinks it created must not silently vanish, so pull the name
+ * out textually instead of dropping the call.
+ */
+function extractNameFromRaw(raw: string): Record<string, unknown> | null {
+  for (const key of NAME_KEYS) {
+    const match = new RegExp(`"${key}"\\s*:\\s*"((?:[^"\\\\]|\\\\.)*)"`).exec(raw);
+    if (match) return { [key]: match[1].replace(/\\"/g, '"').replace(/\\\\/g, "\\") };
+  }
+  return null;
+}
+
+/** A bare, non-JSON `content` that is just the anchor name (`wu_finalize`). */
+function bareNameOf(content: string): string | null {
+  const trimmed = content.trim();
+  if (trimmed.length === 0 || trimmed.startsWith("{") || trimmed.startsWith("[")) return null;
+  return /^[^\s{}"\\]{1,100}$/.test(trimmed) ? trimmed : null;
 }
 
 /** The anchor name carried by an add_anchor toolCall block (direct or xd-enveloped), or null. */
@@ -86,8 +137,15 @@ export function anchorNameOf(block: ContentBlock): string | null {
   if (block.name === XD_WRITE_TOOL) {
     const path = block.arguments.path;
     if (typeof path !== "string" || path.trim() !== XD_ADD_ANCHOR_PATH) return null;
-    const payload = parseContentJson(block.arguments.content);
-    return payload === null ? null : readAnchorArg(payload);
+    const raw = block.arguments.content;
+    const payload = parseContentJson(raw);
+    if (payload !== null) return readAnchorArg(payload);
+    if (typeof raw === "string") {
+      const recovered = extractNameFromRaw(raw);
+      if (recovered !== null) return readAnchorArg(recovered);
+      return bareNameOf(raw);
+    }
+    return null;
   }
   return null;
 }
