@@ -16,13 +16,19 @@ Three tools are exposed to the model:
 - **`add_anchor({ anchor })`** — places a named anchor at the call site. The
   tool call itself is the anchor: its provider-assigned tool-call id is a
   stable, globally unique identity. Names are unique per session;
-  `session_start` is reserved. The anchor marks where the **next** span starts:
-  *anchor A → work → anchor B → compress(A) → work → compress(B)*.
+  `session_start` is reserved. Order is load-bearing: compress the finished
+  unit first, then anchor the next one —
+  *anchor A → work → compress(A) → anchor B → work → compress(B)*. An anchor
+  placed **before** a compress call lies inside that span, is elided with it,
+  and disappears from the anchor list; it cannot be reused.
 - **`compress({ startAnchor, summary })`** — replaces everything from the start
   anchor up to the compress call itself with a **summary the model writes
   itself**. The end of the span is implicit: the compress call's own position.
-- **`expand({ block })`** — returns the full text of a compression block that is
-  currently shown only as an index line under a newer summary.
+  `summary` must be a plain Markdown string — the host silently stringifies an
+  object-shaped summary, so a JSON draft is accepted but loses its shape.
+- **`expand({ block })`** — returns the stored summary of a compression block
+  that is currently shown only as an index line under a newer summary. It
+  returns summaries, never the original messages.
 
 A virtual **`session_start`** anchor is always injected right after the
 original user prompt, so everything since the beginning of the session can be
@@ -47,9 +53,10 @@ prompt · [anchor: session_start] · work1 · [Compressed: a1 → here] (block 1
 - Earlier compressions whose compress call lies before the start anchor stay
   in place: their summaries and yours **accumulate in order**.
 - A span that reaches back across a prior compression **absorbs** it: the
-  absorbed block keeps its text in dcp's chain, appears as a one-line index
-  under the new summary, and comes back in full through `expand`. Nothing the
-  model leaves out is destroyed.
+  absorbed block keeps its summary in dcp's chain, appears as a one-line index
+  under the new summary, and comes back through `expand`. That guarantee covers
+  the absorbed block only — not the current span: its messages leave the
+  model's context, and a chain-root block has no ancestors to expand.
 - Invalid *calls* still fail and change nothing: unknown anchor, empty span,
   empty summary, unknown block id. Invalid *summaries* do not — see below.
 - Session history is never modified; compression only reshapes what is sent to
@@ -75,9 +82,13 @@ A summary is the only record of the span, so the tools ask for a structure:
   (path, `file:line`, session id, commit, URI, command), **not** pasted content.
   Any locator shape is accepted; there is no whitelist.
 - Deviations come back in the compress result as
-  `摘要形状提示（已压缩，未拒绝）` — the compression always applies. A rejection
-  costs a turn and the model re-sends the same draft anyway; the chain keeps the
-  old text reachable, so a thin summary is recoverable rather than fatal.
+  `摘要形状提示（已压缩，未拒绝）` — the compression always applies, and the
+  summary cannot be amended afterwards. A rejection costs a turn and the model
+  re-sends the same draft anyway; only the absorbed blocks' summaries stay
+  reachable, so a thin first summary is not recoverable.
+- `summary` is a plain Markdown string. The host silently stringifies an
+  object-valued summary, so a JSON or key-value draft passes validation but
+  loses the slot structure (and every `证据:` pointer).
 
 ## How it works
 
@@ -127,8 +138,10 @@ A second trigger fires without any token pressure:
 - `[dcp:unit]` — the newest `todo` result reports a finished item set
   (`All items complete`, `Remaining items (0)`, `Remaining items: none.`). The
   work-unit boundary is observable rather than judged, so the reminder demands
-  an anchor for the next unit plus a compress of the finished one. It fires once
-  per finished result (deduped on the result's tool-call id).
+  a compress of the finished unit **first**, then an anchor for the next one.
+  Reversing the order puts the anchor inside the compress span, where it is
+  elided and cannot be reused as a later start point. It fires once per
+  finished result (deduped on the result's tool-call id).
 
 There is no tool-call counter: a call count is not a context cost, and the
 removed `[dcp:budget]` trigger fired three minutes into a session that then had

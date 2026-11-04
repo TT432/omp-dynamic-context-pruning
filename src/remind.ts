@@ -65,8 +65,10 @@ export interface FinishedUnit {
   text: string;
 }
 
-const FULL_SESSION_HINT =
-  'Full-session compression ("session_start") is allowed and nothing is destroyed — absorbed blocks stay recallable with expand — but it is the most lossy call available: prefer compressing a span that starts at an anchor placed after the finished unit.';
+const CHAIN_ROOT_HINT =
+  'Full-session compression ("session_start") is allowed and nothing you already compressed is destroyed, but a chain-root block has no ancestors: expand cannot recover anything from this span, and it is the most lossy call available. If a later live anchor exists, start there instead.';
+const ORDER_HINT =
+  'Place the next anchor AFTER the compress call — an anchor placed before it lies inside the span and is swallowed.';
 
 function num(raw: string | undefined, fallback: number): number {
   const trimmed = (raw ?? "").trim();
@@ -261,9 +263,9 @@ export function maybeAppendReminder(
         return append(
           messages,
           `${REMIND_MARKER} Context is at ~${tokens} tokens${pct}. Compress NOW: ` +
-            `call compress with startAnchor one of ${anchorList(messages) || '"your own anchor"'} and a complete technical ` +
+            `call compress with startAnchor one of ${anchorList(messages) || '"session_start"'} and a complete technical ` +
             `summary of everything since that anchor. Finish the compress before starting any new work. ` +
-            `${FULL_SESSION_HINT}`,
+            `${CHAIN_ROOT_HINT} ${ORDER_HINT}`,
         );
       }
     }
@@ -275,9 +277,10 @@ export function maybeAppendReminder(
     return append(
       messages,
       `${UNIT_MARKER} The todo set just completed — that is a work-unit boundary. ` +
-        `Place an anchor for the next unit, then compress the finished one: ` +
-        `compress with startAnchor one of ${anchorList(messages) || '"your own anchor"'} and a summary whose 当前任务 ` +
-        `says what the next turn should do first. ${FULL_SESSION_HINT}`,
+        `Compress the finished unit NOW with startAnchor one of ${anchorList(messages) || '"session_start"'}. ` +
+        `Only after it succeeds, call add_anchor for the next unit: an anchor added before the compress call is ` +
+        `swallowed by this span and cannot be reused. The summary's 当前任务 must say what the next turn should do first. ` +
+        `${CHAIN_ROOT_HINT}`,
     );
   }
 
@@ -285,5 +288,8 @@ export function maybeAppendReminder(
 }
 
 function append(messages: AgentMessage[], text: string): AgentMessage[] {
-  return [...messages, { role: "user", content: [{ type: "text", text }] }];
+  // Mark the injected text as a harness reminder so it is not mistaken for (or
+  // forged as) ordinary user input.
+  const wrapped = `<system-reminder source="dcp">\n${text}\n</system-reminder>`;
+  return [...messages, { role: "user", content: [{ type: "text", text: wrapped }] }];
 }

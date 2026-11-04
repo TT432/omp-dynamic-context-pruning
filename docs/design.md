@@ -39,13 +39,17 @@ An anchor is a named position in the conversation:
   first user message (role `user` without `tool_result` blocks — the original
   prompt). It is never consumed and is always available as a `startAnchor`.
 
-Anchor lifecycle is the model's job, and the tools say so explicitly:
-`add_anchor` returns "this marks where the NEXT span starts", so the workflow is
-*anchor A → work → anchor B → compress(A) → work → anchor C → compress(B)*. A
-single anchor followed by `compress` consumes the anchor it just placed — the
-pre-chain design let that happen silently and the model then always fell back to
-`session_start` (live evidence: one anchor in 350 tool calls, absorbed 71 s
-after it was created, three full-session compressions in 68 minutes).
+Anchor lifecycle is the model's job, and the tools/reminders now state the
+order: *anchor A → work → compress(A) → anchor B → work → compress(B)*. An
+anchor placed **before** a compress call sits inside that span: the transform
+elides it and the reminder (computed on the transformed copy) no longer lists
+it. The pre-chain design let that happen silently, and the model then always
+fell back to `session_start` (live evidence: one anchor in 350 tool calls,
+absorbed 71 s after it was created, three full-session compressions in 68
+minutes). Compressing from such a swallowed name again is worse than useless:
+the new span starts inside the old block, the old block is superseded and stops
+eliding, and the messages it had compressed come back. The compress result
+therefore names every anchor the span swallowed.
 
 ## Message representation (verified against live transcripts)
 
@@ -123,8 +127,8 @@ The context transform applies every live block:
   per ancestor:
 
   ```
-  已并入本块的旧压缩块（索引，全文未丢失）:
-  - 块 12「a1」：<当前任务 gist> — 全文: expand({block: 12})
+  已并入本块的旧压缩块（索引；仅摘要可 expand，原始消息不可恢复）:
+  - 块 12「a1」：<当前任务 gist> — 摘要: expand({block: 12})
   ```
 
 Ancestors are one line each, so the chain costs O(history) in lines rather than
@@ -186,15 +190,22 @@ locator-inheritance check):
   "gradle.properties has no slash. Use E:/…/gradle.properties? That contains
   slashes.";
 - evidence locators are a *convention*, and a convention can be carried by the
-  prompt plus the chain (the old text is always one `expand` away), which is
-  where the constraint now lives.
+  prompt plus the chain (an absorbed block's summary is always one `expand`
+  away; the current span and a chain root are not recoverable), which is where
+  the constraint now lives.
+
+The summary is a plain Markdown string. An object-valued `summary` is
+stringified by the host before the tool sees it, so a JSON draft passes and
+silently loses the slot structure; the tool description and the compress result
+both state this.
 
 ## Compress reminders
 
 dcp is model-driven: nothing forces a compress, and omp auto-compaction is
 commonly disabled in favor of dcp. Two triggers, both computed on the
-already-transformed copy, both appended as a synthetic user message that is
-never persisted:
+already-transformed copy, both appended as a synthetic user message wrapped in
+`<system-reminder source="dcp">` (never persisted, never mistaken for user
+input):
 
 | Marker | Fires when | Configuration |
 | ------ | ---------- | ------------- |

@@ -261,7 +261,11 @@ const compressTool = createCompressTool({
   const ctx = makeCtx(convo().slice(0, 3));
   const res = await addAnchorTool.execute("tu_new", { anchor: "fresh" }, undefined, undefined, ctx);
   assert(textOf(res).includes('Anchor "fresh" recorded'), "add_anchor confirms with the anchor name");
-  assert(textOf(res).includes("NEXT span"), "add_anchor states that the anchor marks the next span's start");
+  assert(
+    /compress the finished unit first, then place the anchor/.test(textOf(res)) &&
+      /disappears/.test(textOf(res)),
+    "add_anchor states the compress-then-anchor order and the swallowed-anchor risk",
+  );
 
   await assertThrows(
     () => addAnchorTool.execute("tu_other", { anchor: "a1" }, undefined, undefined, makeCtx(convo())),
@@ -657,6 +661,15 @@ const compressTool = createCompressTool({
   assert(render.includes("S:摸底完成。"), "summary injected for enveloped block");
   assert(!render.includes("file a"), "span elided through the envelope");
   assert(render.includes("tu_c9"), "enveloped compress call kept as the span end");
+  // The anchor was added right before the compress call: it falls inside the
+  // span, so the model can never see it again. The result must say so —
+  // reusing that name later would start a span inside the old block.
+  assert(
+    /Anchors swallowed by this span/.test(textOf(res)) && textOf(res).includes('"reorg_done"'),
+    "compress result names the anchors swallowed by the span",
+  );
+  assert(!scanAnchors(out).some((a) => a.name === "reorg_done"), "swallowed anchor is gone from the transformed context");
+  assert(JSON.stringify(res.details ?? {}).includes('"reorg_done"'), "swallowed anchor listed in result details");
 }
 
 // ---------------------------------------------------------------------------
@@ -822,6 +835,10 @@ const compressTool = createCompressTool({
     assert(out.length === msgs.length + 1 && text.includes(UNIT_MARKER), `unit reminder appended: ${wording.slice(0, 24)}`);
     assert(text.includes('"a1"'), "unit reminder lists the available anchors");
     assert(!/force=true/.test(text), "unit reminder no longer demands force");
+    assert(
+      text.indexOf("Compress the finished unit") < text.indexOf("call add_anchor"),
+      "unit reminder compresses the finished unit before placing the next anchor",
+    );
   }
 
   // mid-progress todo sets are not boundaries

@@ -99,7 +99,7 @@ export function createAddAnchorTool(deps: AddAnchorToolDeps): ToolDefinition {
 
       logger.info("Anchor added", { name, toolCallId });
       return textResult(
-        `Anchor "${name}" recorded here. It marks where the NEXT span starts: compress an earlier anchor (or "session_start") when this stretch ends, and keep this one as the start of what comes next.`,
+        `Anchor "${name}" recorded here. Use it as startAnchor when you compress the stretch that follows. If you compress from an earlier anchor later in this same stretch, this anchor lies inside that span and disappears — so compress the finished unit first, then place the anchor for the next one.`,
         { anchor: name },
       );
     },
@@ -122,11 +122,11 @@ export function createCompressTool(deps: CompressToolDeps): ToolDefinition {
   const parameters = zod.object({
     startAnchor: zod.string({
       description:
-        'Anchor where compression starts (consumed); "session_start" compresses from the original prompt. Prefer a named anchor placed after a finished work unit.',
+        'Live anchor where compression starts (it is consumed); "session_start" compresses from the original prompt. Anchors swallowed by an earlier compression are unusable.',
     }),
     summary: zod.string({
       description:
-        "Your summary of everything from the anchor up to this call — the only record of that span in later turns (absorbed older blocks stay recallable through expand). Recommended slots, in order: ## 当前任务 / ## 已完成 / ## 未完成 / ## 约束 / ## 文件与命令 / ## 在跑作业与句柄; each fact a `- ` bullet ending in `证据: <定位>`. Shape is advisory: a summary that does not follow it is still applied.",
+        "Plain Markdown string (never a JSON object or key-value map) — the only record of the span; original messages are not recoverable. Recommended slots, in order: ## 当前任务 / ## 已完成 / ## 未完成 / ## 约束 / ## 文件与命令 / ## 在跑作业与句柄; each fact a `- ` bullet ending in `证据: <定位>`. Shape is advisory: a summary that does not follow it is still applied, and cannot be amended afterwards.",
     }),
   });
 
@@ -186,6 +186,14 @@ export function createCompressTool(deps: CompressToolDeps): ToolDefinition {
         absorbed.push(b);
       }
 
+      // Anchors that sit inside the span are elided with it. The model cannot
+      // see them afterwards (the reminder scans the transformed copy), so the
+      // result has to say which names vanished — otherwise reusing one of them
+      // later starts a span inside the old block and resurrects elided text.
+      const swallowed = anchors.filter(
+        (a) => a.toolCallId !== null && a.msgIndex >= elideFrom && a.msgIndex < endIdx,
+      );
+
       const block: CompressionBlock = {
         id: state.nextBlockId++,
         startName,
@@ -220,12 +228,19 @@ export function createCompressTool(deps: CompressToolDeps): ToolDefinition {
               .map((b) => `块 ${b.id}「${b.startName}」${gistOf(b.summary, 60) || "(无摘要)"} — expand({block: ${b.id}})`)
               .join("；")}`
           : "";
+      const swallowedNote =
+        swallowed.length > 0
+          ? ` Anchors swallowed by this span (now elided, not reusable): ${swallowed
+              .map((a) => `"${a.name}"`)
+              .join(", ")}. Do not pass them to compress again — place the next anchor after this call.`
+          : "";
       return textResult(
-        `Compressed from "${startName}" to this compress call (${elided} message(s) elided) as block ${block.id}.${absorbedNote} The summary now replaces that span in your context, right before this compress call.${formatProblems(parsed.problems)}`,
+        `Compressed from "${startName}" to this compress call (${elided} message(s) elided) as block ${block.id}.${absorbedNote}${swallowedNote} The summary now replaces that span in your context, right before this compress call.${formatProblems(parsed.problems)}`,
         {
           blockId: block.id,
           elidedMessages: elided,
           absorbedBlockIds: absorbed.map((b) => b.id),
+          swallowedAnchors: swallowed.map((a) => a.name),
           problems: parsed.problems,
         },
       );
@@ -246,10 +261,10 @@ export interface ExpandToolDeps {
 /** Render one block in full, plus its own index lines so the model can walk back. */
 function renderExpanded(blocks: CompressionBlock[], block: CompressionBlock): string {
   const parents = ancestorsOf(blocks, block);
-  const head = `[block ${block.id}「${block.startName}」 — 全文]`;
+  const head = `[block ${block.id}「${block.startName}」 — 摘要全文；原始消息不可恢复]`;
   if (parents.length === 0) return `${head}\n${block.summary}`;
   const index = parents
-    .map((a) => `- 块 ${a.id}「${a.startName}」：${gistOf(a.summary) || "(无摘要)"} — 全文: expand({block: ${a.id}})`)
+    .map((a) => `- 块 ${a.id}「${a.startName}」：${gistOf(a.summary) || "(无摘要)"} — 摘要: expand({block: ${a.id}})`)
     .join("\n");
   return `${head}\n${block.summary}\n\n更深一层（索引）:\n${index}`;
 }
